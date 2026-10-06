@@ -1,0 +1,24 @@
+# Python virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Secrets
+.env
+*.env
+
+# Build output
+build/
+dist/
+*.spec
+
+# Local database
+*.db
+*.sqlite
+*.sqlite3
+
+# Windows files
+Thumbs.db
+Desktop.ini

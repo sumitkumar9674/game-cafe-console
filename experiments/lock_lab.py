@@ -15,6 +15,12 @@ def _overlay_was_destroyed(event: tk.Event) -> None:
         lock_overlay = None
 
 
+def ignore_overlay_close_request() -> None:
+    """Keep the overlay open when Windows requests that it close."""
+    # Alt+F4 sends WM_DELETE_WINDOW, so handling it here prevents destruction.
+    pass
+
+
 def activate_lock() -> None:
     """Create the fullscreen test overlay if it is not already active."""
     global lock_overlay
@@ -30,7 +36,7 @@ def activate_lock() -> None:
     # A Toplevel is a separate window. Fullscreen makes it cover the current
     # screen without adding any operating-system restrictions.
     lock_overlay.attributes("-fullscreen", True)
-    lock_overlay.protocol("WM_DELETE_WINDOW", deactivate_lock)
+    lock_overlay.protocol("WM_DELETE_WINDOW", ignore_overlay_close_request)
     lock_overlay.bind("<Destroy>", _overlay_was_destroyed)
 
     content = tk.Frame(lock_overlay, background="#171717")
@@ -88,14 +94,14 @@ def main() -> None:
     global control_window
 
     control_window = tk.Tk()
-    control_window.title("Lock Lab V1")
+    control_window.title("Lock Lab V2")
     control_window.geometry("320x210")
     control_window.resizable(False, False)
     control_window.protocol("WM_DELETE_WINDOW", kill_software)
 
     tk.Label(
         control_window,
-        text="Lock Lab V1",
+        text="Lock Lab V2",
         font=("Segoe UI", 18, "bold"),
     ).pack(pady=(18, 12))
 

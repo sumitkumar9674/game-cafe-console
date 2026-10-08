@@ -1,0 +1,5 @@
+# Required for encrypted, code-verified onboarding key transfer.
+# Python's standard library does not provide authenticated encryption.
+cryptography
+# Qt Quick/QML supplies the native Windows UI and rendering layer.
+PySide6>=6.8,<7

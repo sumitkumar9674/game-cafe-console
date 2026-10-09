@@ -8,13 +8,13 @@ Item {
     Rectangle {
         anchors.fill: parent
         radius: width / 2
-        color: "#224c56"
-        border.color: "#35c7c7"
+        color: "#274C58"
+        border.color: "#64BCC1"
         border.width: 1
         Text {
             anchors.centerIn: parent
             text: (bridge.view.cafeName || "GC").substring(0, 2).toUpperCase()
-            color: "#cdfbfa"
+            color: "#D8F5F4"
             font.pixelSize: avatar.diameter * 0.32
             font.weight: Font.Bold
         }

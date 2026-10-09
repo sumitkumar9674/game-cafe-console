@@ -22,7 +22,7 @@ Do not launch `--console-child` directly. The controller creates the child proce
 3. On PC 2, launch the same build. Discover the café and request to join. On PC 1, open Connections, start pairing, compare the seven-character code shown on PC 2, then approve. Verify PC 2 enters CafeConsole; a code expires after five minutes and five wrong entries reject that request.
 4. From PC 1, start a timed session on PC 2 with buffer and Custom Minutes. Test player rename, Pause/Resume during buffer and paid time, custom Add Time with both confirmations, End Session, lock, and history filtering. Repeat with a No-Timer session and verify paused time is excluded.
 5. While PC 2 has a session, disconnect or close the Admin. Confirm PC 2 stays usable, can rename/end locally, and later synchronizes history to the returning Admin. Simulate an abrupt controller termination only on a supervised test machine; verify restart finalizes at the last checkpoint, not the whole outage.
-6. Check the Default desktop widget, tray hide/restore, café avatar Browse/preview/synchronization, and offline PC visibility. Test Admin transfer only when no customer session is active. Test local Close Software with password and remote Exit Software with confirmation; verify Default is restored. The exited PC no longer enforces café access until restarted.
+6. Check the Default desktop widget, taskbar minimize/restore, café avatar Browse/preview/synchronization, and offline PC visibility. Test Admin transfer only when no customer session is active. Test local Close Software with password and remote Exit Software with confirmation; verify Default is restored. The exited PC no longer enforces café access until restarted.
 
 Do not automate desktop switches or Windows sign-out during development. An exclusive fullscreen game may cover the widget; it does not inject into games or use hooks.
 
@@ -36,6 +36,12 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build_game_cafe.ps1
 ```
 
 The result is the **whole** `dist\GameCafeConsole\` folder, including `GameCafeConsole.exe`, Qt DLLs/plugins, and QML resources. Copy the whole folder—not only the EXE—to another Windows PC. The same EXE re-launches as the CafeConsole child. The one-folder layout is suitable for later installer work; do not ship a café's SQLite database inside it. Rebuild and update both PCs together when testing protocol/UI changes.
+
+Optional branding belongs in `game_cafe\assets\branding`: use `app_icon.ico`
+for the EXE/title/taskbar icon and `app_logo.png` for the startup/Admin-login
+loading screen. The build discovers the icon automatically and packages the
+assets directory. Missing or invalid artwork safely uses the standard icon and
+the existing StickForYou text fallback.
 
 PyInstaller and Qt's `pyside6-deploy` are both viable deployment routes. This project keeps PyInstaller for now because its existing Windows child-process re-exec path works with a one-folder bundle and the QML files can be included explicitly. A packaged build still needs a supervised two-PC smoke test, especially Qt Quick rendering on CafeConsole. The child selects Qt Quick's software graphics API before its first window as a compatibility fallback; confirm its appearance and performance on target machines.
 

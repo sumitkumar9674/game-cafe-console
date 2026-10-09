@@ -4,17 +4,46 @@ import QtQuick.Layouts
 
 Item {
     id: page
+    Theme { id: theme }
+    readonly property int brandSize: Math.min(120, Math.max(88, height * 0.09))
     property string staffPanel: ""
-    Rectangle { anchors.fill: parent; color: "#101c2b" }
+    function validMinutes(value, allowZero) {
+        let text = String(value).trim()
+        if (!/^[0-9]+$/.test(text)) return false
+        let minutes = Number(text)
+        return Number.isInteger(minutes) && minutes <= 1440 && minutes >= (allowZero ? 0 : 1)
+    }
+    function toggleStaffAccess() {
+        if (staffPanel === "staff") {
+            staffPassword.text = ""
+            bridge.lockStaffAccess()
+            root.cancelConfirmation()
+            staffPanel = ""
+        } else {
+            bridge.lockStaffAccess()
+            staffPassword.text = ""
+            staffPanel = "staff"
+        }
+    }
+    Component.onDestruction: bridge.lockStaffAccess()
+    Connections {
+        target: bridge
+        function onStaffAuthChanged() {
+            if (bridge.staffAuthorized) staffPassword.text = ""
+            else root.cancelConfirmation()
+        }
+    }
+    Rectangle { anchors.fill: parent; color: "#0B1120" }
     ColumnLayout {
         anchors.fill: parent; anchors.margins: 36; spacing: 15
-        RowLayout { Layout.fillWidth: true
-            Avatar { diameter: 48 }
+        RowLayout { Layout.fillWidth: true; spacing: 14
+            BrandLogo { Layout.preferredWidth: page.brandSize; Layout.preferredHeight: page.brandSize }
+            Avatar { diameter: Math.round(page.brandSize * 0.7) }
             ColumnLayout { Layout.fillWidth: true
-                Text { text: bridge.view.cafeName || "Game Cafe Console"; color: "#f5fbfd"; font.pixelSize: 18; font.bold: true }
-                Text { text: bridge.view.ownName || "User PC"; color: "#91a7ba" }
+                Text { text: bridge.view.cafeName || "GameGrid"; color: "#F4F7FB"; font.pixelSize: 18; font.bold: true }
+                Text { text: bridge.view.ownName || "User PC"; color: "#A8B8CA" }
             }
-            Text { text: bridge.view.connectionNote || "LOCAL CAFE"; color: "#8fb0bf"; font.pixelSize: 12 }
+            Text { text: bridge.view.connectionNote || "LOCAL CAFE"; color: "#A8B8CA"; font.pixelSize: 12 }
         }
         Item { Layout.fillHeight: true }
         Panel {
@@ -23,11 +52,11 @@ Item {
             implicitHeight: consoleBody.implicitHeight + 54
             ColumnLayout {
                 id: consoleBody; anchors.fill: parent; anchors.margins: 27; spacing: 18
-                Text { text: bridge.view.accessAllowed ? "YOUR SESSION IS ACTIVE" : "THIS PC IS LOCKED"; color: bridge.view.accessAllowed ? "#51d9bc" : "#f0b66c"; font.bold: true; font.pixelSize: 13 }
-                Text { text: bridge.view.player || "Guest"; color: "#f7fbfd"; font.pixelSize: 29; font.bold: true }
-                Text { text: bridge.view.phase || "WAITING"; color: "#96aec0"; font.pixelSize: 14 }
-                Text { text: bridge.view.timeText || "00:00:00"; color: "#35c7c7"; font.pixelSize: 53; font.bold: true; visible: bridge.view.hasSession }
-                Text { text: bridge.view.feedback || "Ask staff to start or renew your session."; color: "#a8c0ce"; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                Text { text: bridge.view.accessAllowed ? "YOUR SESSION IS ACTIVE" : "THIS PC IS LOCKED"; color: bridge.view.accessAllowed ? "#A4B36A" : "#F2A65A"; font.bold: true; font.pixelSize: 13 }
+                Text { text: bridge.view.player || "Guest"; color: "#F4F7FB"; font.pixelSize: 29; font.bold: true }
+                Text { text: bridge.view.phase || "WAITING"; color: "#A8B8CA"; font.pixelSize: 14 }
+                Text { objectName: "consoleSessionTimer"; text: bridge.view.timeText || "00:00:00"; color: bridge.view.phase === "BUFFER" ? theme.buffer : bridge.view.phase === "PAUSED" ? theme.paused : bridge.view.phase === "GRACE" || bridge.view.phase === "EXPIRED" ? theme.grace : theme.active; font.pixelSize: 53; font.bold: true; visible: bridge.view.hasSession }
+                Text { text: bridge.view.feedback || "Ask staff to start or renew your session."; color: "#A8B8CA"; wrapMode: Text.WordWrap; Layout.fillWidth: true }
                 RowLayout { Layout.fillWidth: true; spacing: 10
                     ActionButton { text: "Open desktop"; visible: bridge.view.accessAllowed; onClicked: bridge.goDesktop() }
                     ActionButton { text: bridge.view.requestCooldown > 0 ? "Wait " + bridge.view.requestCooldown + "s" : (bridge.view.feedback || "").startsWith("Request failed") ? "Retry request" : "Request unlock"; visible: !bridge.view.accessAllowed; enabled: bridge.view.requestCooldown <= 0 && !bridge.busy; onClicked: bridge.requestUnlock() }
@@ -41,20 +70,92 @@ Item {
         }
         Item { Layout.fillHeight: true }
         RowLayout { Layout.alignment: Qt.AlignHCenter
-            ActionButton { text: "Staff access"; secondary: true; onClicked: page.staffPanel = page.staffPanel ? "" : "staff" }
+            ActionButton { text: page.staffPanel === "staff" ? "Close Staff Access" : "Staff Access"; secondary: true; onClicked: page.toggleStaffAccess() }
         }
         Panel { Layout.alignment: Qt.AlignHCenter; Layout.preferredWidth: Math.min(page.width - 72, 650); implicitHeight: staffBody.implicitHeight + 36; visible: page.staffPanel === "staff"
             ColumnLayout { id: staffBody; anchors.fill: parent; anchors.margins: 18; spacing: 12
-                Text { text: "Staff access · Admin password required"; color: "#f3f9fb" }
-                RowLayout { Layout.fillWidth: true
-                    TextField { id: staffPassword; objectName: "staffPasswordField"; Layout.fillWidth: true; echoMode: showPassword.checked ? TextInput.Normal : TextInput.Password; placeholderText: "Admin password" }
-                    CheckBox { id: showPassword; objectName: "showStaffPassword"; text: "Show"; checked: false }
+                Text { text: bridge.staffAuthorized ? "Staff Controls" : "Staff Access · Admin password required"; color: "#F4F7FB"; font.bold: true }
+                ColumnLayout {
+                    visible: !bridge.staffAuthorized
+                    Layout.fillWidth: true
+                    PasswordField {
+                        id: staffPassword
+                        objectName: "staffPasswordField"
+                        Layout.fillWidth: true
+                        placeholderText: "Admin password"
+                        onAccepted: bridge.authenticateStaff(text)
+                    }
+                    ActionButton { objectName: "staffAuthenticateButton"; text: "Unlock Staff Controls"; Layout.fillWidth: true; enabled: !bridge.busy; onClicked: bridge.authenticateStaff(staffPassword.text) }
                 }
-                ActionButton { text: "Switch to Admin"; Layout.fillWidth: true; enabled: bridge.view.canSwitchAdmin && !bridge.busy; onClicked: bridge.switchAdmin(staffPassword.text) }
-                Rectangle { Layout.fillWidth: true; implicitHeight: 1; color: "#395064" }
-                ActionButton { text: "Close software"; Layout.fillWidth: true; danger: true; onClicked: root.ask("Close software", "Close Game Cafe Console on this PC? An active session will be finalized and the Windows desktop restored.", "Close", function(){bridge.closeSoftware(staffPassword.text)}) }
+                ColumnLayout {
+                    objectName: "staffControls"
+                    visible: bridge.staffAuthorized
+                    Layout.fillWidth: true
+                    spacing: 10
+                    Text { objectName: "staffSessionTimer"; text: (bridge.view.phase || "WAITING") + " · " + (bridge.view.timeText || "00:00:00"); color: bridge.view.phase === "BUFFER" ? theme.buffer : bridge.view.phase === "PAUSED" ? theme.paused : bridge.view.phase === "GRACE" || bridge.view.phase === "EXPIRED" ? theme.grace : theme.active; font.bold: true }
+                    RowLayout {
+                        visible: !bridge.view.hasSession
+                        Layout.fillWidth: true
+                        DarkComboBox { id: staffKind; objectName: "staffSessionKind"; model: ["Timed", "No timer"]; Layout.preferredWidth: 115; onActivated: bridge.touchStaffAccess() }
+                        DarkComboBox { id: staffPaid; objectName: "staffSessionDuration"; model: ["15", "30", "60", "120", "Custom Minutes"]; currentIndex: 2; visible: staffKind.currentIndex === 0; Layout.preferredWidth: 145; onActivated: bridge.touchStaffAccess() }
+                        TextField { id: staffCustomPaid; visible: staffKind.currentIndex === 0 && staffPaid.currentIndex === 4; placeholderText: "Minutes"; Layout.preferredWidth: 86; inputMethodHints: Qt.ImhDigitsOnly; onTextEdited: bridge.touchStaffAccess() }
+                        TextField { id: staffBuffer; text: "0"; placeholderText: "Buffer"; Layout.preferredWidth: 82; inputMethodHints: Qt.ImhDigitsOnly; onTextEdited: bridge.touchStaffAccess() }
+                    }
+                    ActionButton {
+                        objectName: "staffStartButton"
+                        text: "Start / Set Session"
+                        visible: !bridge.view.hasSession
+                        Layout.fillWidth: true
+                        enabled: !bridge.busy
+                        onClicked: {
+                            bridge.touchStaffAccess()
+                            let kind = staffKind.currentIndex === 0 ? "timed" : "open"
+                            let paid = kind === "timed" ? (staffPaid.currentIndex === 4 ? staffCustomPaid.text : staffPaid.currentText) : "0"
+                            if ((kind === "timed" && !page.validMinutes(paid, false)) || !page.validMinutes(staffBuffer.text, true)) {
+                                root.ask("Invalid session time", "Use whole minutes: paid time 1 to 1440 and buffer 0 to 1440.", "OK", function(){})
+                                return
+                            }
+                            root.ask("Start local session", "Start this " + (kind === "timed" ? paid + " minute timed" : "no-timer") + " session with " + staffBuffer.text + " buffer minutes?", "Start Session", function(){ bridge.staffStartSession(kind, paid, staffBuffer.text) })
+                        }
+                    }
+                    RowLayout {
+                        visible: bridge.view.hasSession && bridge.view.kind === "timed"
+                        Layout.fillWidth: true
+                        DarkComboBox { id: staffAdd; objectName: "staffAddDuration"; model: ["1", "2", "5", "15", "30", "60", "Custom Minutes"]; currentIndex: 3; Layout.fillWidth: true; onActivated: bridge.touchStaffAccess() }
+                        TextField { id: staffCustomAdd; visible: staffAdd.currentIndex === 6; placeholderText: "Minutes"; Layout.preferredWidth: 86; inputMethodHints: Qt.ImhDigitsOnly; onTextEdited: bridge.touchStaffAccess() }
+                        ActionButton {
+                            objectName: "staffAddButton"
+                            text: "Add Time"
+                            enabled: !bridge.busy
+                            onClicked: {
+                                bridge.touchStaffAccess()
+                                let raw = staffAdd.currentIndex === 6 ? staffCustomAdd.text : staffAdd.currentText
+                                if (!page.validMinutes(raw, false)) {
+                                    root.ask("Invalid time", "Use a whole number from 1 to 1440 minutes.", "OK", function(){})
+                                    return
+                                }
+                                let minutes = Number(raw)
+                                let preview = bridge.previewStaffAdd(minutes)
+                                root.ask("Confirm added time", preview, "Add Time", function(){ bridge.staffAddTime(minutes) })
+                            }
+                        }
+                    }
+                    Rectangle { Layout.fillWidth: true; implicitHeight: 1; color: "#455C73" }
+                    ActionButton { text: "Switch to Admin"; Layout.fillWidth: true; enabled: bridge.view.canSwitchAdmin && !bridge.view.hasSession && !bridge.busy; onClicked: bridge.switchAdmin() }
+                    ActionButton { objectName: "staffCloseSoftware"; text: "Close Software"; Layout.fillWidth: true; danger: true; enabled: !bridge.busy; onClicked: {
+                        if (bridge.hasLocalSession()) {
+                            root.ask("Active Session Detected",
+                                     "An active gaming session is running on this computer. Closing GameGrid will end this session and save its history. Do you want to continue?",
+                                     "End Session & Exit", function(){ bridge.closeSoftware() })
+                        } else {
+                            root.ask("Close software", "Close GameGrid on this PC and restore the normal Windows desktop?",
+                                     "Close", function(){ bridge.closeSoftware() })
+                        }
+                    } }
+                    ActionButton { objectName: "lockStaffControls"; text: "Lock Staff Controls"; secondary: true; Layout.fillWidth: true; onClicked: { staffPassword.text = ""; root.cancelConfirmation(); bridge.lockStaffAccess() } }
+                }
             }
         }
-        Text { text: "Developed by Sumit Kumar · StickForYou"; color: "#7892a4"; font.pixelSize: 11; Layout.alignment: Qt.AlignHCenter }
+        Text { text: "Developed by Sumit Kumar · StickForYou"; color: "#8398AC"; font.pixelSize: 11; Layout.alignment: Qt.AlignHCenter }
     }
 }

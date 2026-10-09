@@ -12,6 +12,7 @@ import time
 import uuid
 
 from .storage import Store
+from .lifecycle import lifecycle_event
 from .security import sign_node, verify_node
 
 
@@ -257,11 +258,16 @@ class NodeNetwork:
 
     def stop(self) -> None:
         self.stop_event.set()
+        lifecycle_event("network_sockets_closing")
         for sock in (self.tcp, self.udp):
             if sock:
                 sock.close()
         for thread in self.threads:
+            lifecycle_event("network_listener_join_started",
+                            worker=thread.name, worker_alive=thread.is_alive())
             thread.join(timeout=1.0)
+            lifecycle_event("network_listener_join_completed",
+                            worker=thread.name, worker_alive=thread.is_alive())
         self.tcp = self.udp = None
 
     def call(self, ip: str, operation: str, data: dict) -> dict:
@@ -339,6 +345,9 @@ class NodeNetwork:
                                   "response", body,
                                   self.store.node_private_key())
                 send_message(connection, response)
+                if operation == "remote_exit" and body["ok"] and result.get("accepted"):
+                    # Exit only after the acknowledgement has been sent.
+                    self.runtime.notify("remote_exit")
             except Exception as error:
                 try:
                     send_message(connection, {"ok": False, "error": str(error)})

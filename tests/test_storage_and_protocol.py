@@ -3,6 +3,7 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import importlib.util
+import json
 import secrets
 import sqlite3
 import unittest
@@ -13,11 +14,64 @@ from game_cafe.network import (PAIRING_ALPHABET, create_pairing_key,
                                seal_welcome, signed, verify_signed)
 from game_cafe.storage import Store, new_pool, verify_password
 from game_cafe.security import (create_admin_signing_record,
-                                create_node_keypair, sign_admin_proof,
-                                unlock_admin_signing_key, verify_admin_proof)
+                                create_node_keypair, sign_admin_proof, sign_node,
+                                unlock_admin_signing_key, verify_admin_proof,
+                                verify_node)
 
 
 class StorageAndProtocolTest(unittest.TestCase):
+    def test_oversized_legacy_snapshot_is_pruned_on_reopen(self):
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "legacy.sqlite3"
+            store = Store(path)
+            snapshot, secret = new_pool("Cafe", store.pc_id, "PC-01", "Owner",
+                                        "long test password", store.node_public_key())
+            store.save_pool(snapshot, secret, join=True)
+            snapshot["history"][store.pc_id] = [
+                {"id": str(number), "ended_at": number} for number in range(151)]
+            with store.db:
+                store.db.execute("UPDATE pools SET snapshot=? WHERE pool_id=?",
+                                 (json.dumps(snapshot), snapshot["pool_id"]))
+            store.close()
+            reopened = Store(path)
+            self.assertEqual([item["id"] for item in
+                              reopened.snapshot()["history"][reopened.pc_id]],
+                             [str(number) for number in range(51, 151)])
+            raw = json.loads(reopened.db.execute(
+                "SELECT snapshot FROM pools WHERE pool_id=?",
+                (snapshot["pool_id"],)).fetchone()[0])
+            self.assertEqual(len(raw["history"][reopened.pc_id]), 100)
+            reopened.close()
+
+    def test_oversized_local_signed_record_is_resigned_without_identity_change(self):
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "owner.sqlite3"
+            store = Store(path)
+            snapshot, secret = new_pool("Cafe", store.pc_id, "PC-01", "Owner",
+                                        "long test password", store.node_public_key())
+            store.save_pool(snapshot, secret, join=True)
+            owner = store.pc_id
+            payload = {"pool_id": snapshot["pool_id"], "pc_id": owner,
+                       "version": 1, "session": None,
+                       "history": [{"id": str(number), "pc_id": owner,
+                                    "paid_minutes": 0, "ended_at": number}
+                                   for number in range(151)],
+                       "grants": [], "legacy": {}}
+            with store.db:
+                store.db.execute("INSERT INTO owner_records VALUES(?,?,?,?,?)",
+                                 (snapshot["pool_id"], owner, 1, json.dumps(payload),
+                                  sign_node(store.node_private_key(), payload)))
+            store.close()
+            reopened = Store(path)
+            record = reopened.owner_records()[0]
+            self.assertEqual(record["payload"]["version"], 2)
+            self.assertEqual([item["id"] for item in record["payload"]["history"]],
+                             [str(number) for number in range(51, 151)])
+            verify_node(reopened.node_public_key(), record["payload"],
+                        record["signature"])
+            self.assertEqual(reopened.pc_id, owner)
+            reopened.close()
+
     def test_existing_database_gets_pairing_columns_without_data_reset(self):
         with TemporaryDirectory() as folder:
             path = Path(folder) / "existing.sqlite3"

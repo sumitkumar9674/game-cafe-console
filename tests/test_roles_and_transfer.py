@@ -7,7 +7,7 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
-from game_cafe.runtime import Runtime, customer_controls
+from game_cafe.runtime import PEER_ONLINE_SECONDS, Runtime, customer_controls
 from game_cafe.security import (create_local_command_key, open_local_password,
                                 seal_local_password)
 from game_cafe.storage import Store, new_pool
@@ -155,6 +155,36 @@ class AdminHandoffTest(unittest.TestCase):
         self.assertFalse(self.user.is_admin())
         self.assertEqual(self.second.snapshot()["active_admin"]["pc_id"],
                          self.first.pc_id)
+
+    def test_confirmed_admin_status_uses_existing_peer_freshness_window(self):
+        with patch.object(self.admin.network, "call", side_effect=OSError("offline")):
+            self.admin.login_admin(PASSWORD)
+        self.assertTrue(self.user.verified_admin_online())
+        snapshot = self.user.snapshot()
+        observed_at = time.time()
+        self.user.peer_statuses[self.first.pc_id] = (observed_at, {
+            "pc_id": self.first.pc_id,
+            "admin": True,
+            "admin_term": snapshot["active_admin"]["term"],
+        })
+        with patch("game_cafe.runtime.time.time",
+                   return_value=observed_at + PEER_ONLINE_SECONDS - 0.1):
+            self.assertTrue(self.user.confirmed_remote_admin_online())
+        with patch("game_cafe.runtime.time.time",
+                   return_value=observed_at + PEER_ONLINE_SECONDS + 0.1):
+            self.assertFalse(self.user.confirmed_remote_admin_online())
+
+    def test_unverified_or_mismatched_admin_status_is_not_accepted(self):
+        with patch.object(self.admin.network, "call", side_effect=OSError("offline")):
+            self.admin.login_admin(PASSWORD)
+        self.assertTrue(self.user.verified_admin_online())
+        snapshot = self.user.snapshot()
+        self.user.peer_statuses[self.first.pc_id] = (time.time(), {
+            "pc_id": self.first.pc_id,
+            "admin": True,
+            "admin_term": snapshot["active_admin"]["term"] + 1,
+        })
+        self.assertFalse(self.user.confirmed_remote_admin_online())
 
     def test_dashboard_keeps_offline_registered_pcs_visible(self):
         self.admin.login_admin(PASSWORD)

@@ -31,15 +31,22 @@ if ($LASTEXITCODE -ne 0) {
 
 Push-Location $projectRoot
 try {
-    & $PythonExecutable -m PyInstaller `
-        --noconfirm `
-        --clean `
-        --onedir `
-        --windowed `
-        --add-data "game_cafe\qml;game_cafe\qml" `
-        --hidden-import PySide6.QtQuickControls2 `
-        --name GameCafeConsole `
-        "run_game_cafe.py"
+    $iconPath = Join-Path $projectRoot "game_cafe\assets\branding\app_icon.ico"
+    $pyInstallerArguments = @(
+        "--noconfirm",
+        "--clean",
+        "--onedir",
+        "--windowed",
+        "--add-data", "game_cafe\qml;game_cafe\qml",
+        "--add-data", "game_cafe\assets;game_cafe\assets",
+        "--hidden-import", "PySide6.QtQuickControls2",
+        "--name", "GameCafeConsole"
+    )
+    if (Test-Path -LiteralPath $iconPath) {
+        $pyInstallerArguments += @("--icon", $iconPath)
+    }
+    $pyInstallerArguments += "run_game_cafe.py"
+    & $PythonExecutable -m PyInstaller @pyInstallerArguments
     if ($LASTEXITCODE -ne 0) {
         throw "PyInstaller failed with exit code $LASTEXITCODE."
     }

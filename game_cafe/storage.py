@@ -20,7 +20,7 @@ from .security import (create_admin_signing_record, create_node_keypair,
 
 
 PASSWORD_ITERATIONS = 600_000
-HISTORY_PER_PC = 20
+HISTORY_PER_PC = 100
 
 
 def default_data_path() -> Path:
@@ -75,9 +75,11 @@ def new_pool(cafe_name: str, pc_id: str, pc_name: str,
         "admin_signing": signing,
         "admin_signing_keys": [signing["public"]],
         "members": {pc_id: {"name": pc_name.strip(),
-                            "public_key": pc_public_key}},
+                            "public_key": pc_public_key,
+                            "last_connected_at": time.time()}},
         "settings": {"grace_minutes": 10, "auto_signout_enabled": False,
-                     "auto_signout_minutes": 30},
+                     "auto_signout_minutes": 30,
+                     "computer_sort": "recent"},
         "sessions": {}, "history": {},
         "active_admin": {"pc_id": pc_id, "term": 1,
                          "expires_at": time.time() + 15, "proof": None},
@@ -144,8 +146,60 @@ class Store:
             if column not in join_columns:
                 self.db.execute(f"ALTER TABLE pending_joins ADD COLUMN {column} {definition}")
         self.db.commit()
+        self._migrate_local_owner_history()
+        # Older snapshots may predate the bounded-history policy.
+        for pool_id, snapshot_text in self.db.execute(
+                "SELECT pool_id,snapshot FROM pools").fetchall():
+            snapshot = json.loads(snapshot_text)
+            original_history = copy.deepcopy(snapshot.get("history", {}))
+            self.prune_history(snapshot)
+            for (payload_text,) in self.db.execute(
+                    "SELECT payload FROM owner_records WHERE pool_id=?", (pool_id,)):
+                payload = json.loads(payload_text)
+                snapshot["history"][payload["pc_id"]] = payload["history"][-HISTORY_PER_PC:]
+            if snapshot["history"] != original_history:
+                with self.db:
+                    self.db.execute("UPDATE pools SET snapshot=? WHERE pool_id=?",
+                                    (json.dumps(snapshot, separators=(",", ":")), pool_id))
         if not self.local("pc_id"):
             self.set_local("pc_id", uuid.uuid4().hex)
+
+    def _migrate_local_owner_history(self) -> None:
+        """Only this PC can re-sign an oversized historical owner record."""
+        own = self.local("pc_id")
+        private = self.local("node_private_key")
+        if not own or not private:
+            return
+        for pool_id, payload_text, signature in self.db.execute(
+                "SELECT pool_id,payload,signature FROM owner_records WHERE pc_id=?",
+                (own,)).fetchall():
+            payload = json.loads(payload_text)
+            if len(payload["history"]) <= HISTORY_PER_PC:
+                continue
+            row = self.db.execute("SELECT snapshot FROM pools WHERE pool_id=?",
+                                  (pool_id,)).fetchone()
+            if not row:
+                continue
+            snap = json.loads(row[0])
+            public = snap["members"].get(own, {}).get("public_key")
+            if public != node_public_from_private(private):
+                continue
+            verify_node(public, payload, signature)
+            payload["version"] += 1
+            payload["history"] = payload["history"][-HISTORY_PER_PC:]
+            retained = {item["id"] for item in payload["history"]}
+            if payload["session"]:
+                retained.add(payload["session"]["id"])
+            payload["grants"] = [item for item in payload["grants"]
+                                 if item["command"]["session_id"] in retained]
+            payload["legacy"] = {key: value for key, value in
+                                 payload.get("legacy", {}).items() if key in retained}
+            with self.db:
+                self.db.execute(
+                    "UPDATE owner_records SET version=?,payload=?,signature=? "
+                    "WHERE pool_id=? AND pc_id=?",
+                    (payload["version"], json.dumps(payload, separators=(",", ":")),
+                     sign_node(private, payload), pool_id, own))
 
     def close(self) -> None:
         with self._lock:
@@ -196,6 +250,7 @@ class Store:
             if not row:
                 return None
             result = json.loads(row[0])
+            self.prune_history(result)
             for (payload_text,) in self.db.execute(
                     "SELECT payload FROM owner_records WHERE pool_id=?", (pool_id,)):
                 payload = json.loads(payload_text)
@@ -203,12 +258,8 @@ class Store:
                 result["sessions"].pop(owner, None)
                 if payload["session"] is not None:
                     result["sessions"][owner] = payload["session"]
-                history = {item["id"]: item for item in
-                           result["history"].get(owner, [])}
-                history.update({item["id"]: item for item in payload["history"]})
-                result["history"][owner] = sorted(
-                    history.values(), key=lambda item: item["ended_at"]
-                )[-HISTORY_PER_PC:]
+                # The signed owner version is authoritative; snapshot unions revive deletions.
+                result["history"][owner] = payload["history"][-HISTORY_PER_PC:]
             return result
 
     def owner_records(self) -> list[dict]:
@@ -220,7 +271,8 @@ class Store:
 
     def save_owner_record(self, session: dict | None, history: list[dict],
                           grants: list[dict], run_id: str,
-                          activity_at: float) -> dict:
+                          activity_at: float,
+                          clear_command: dict | None = None) -> dict:
         """Persist the owner's signed state and snapshot in one transaction."""
         with self._lock, self.db:
             snap = self.snapshot()
@@ -243,7 +295,11 @@ class Store:
             payload = {"pool_id": snap["pool_id"], "pc_id": owner,
                        "version": (previous["version"] + 1) if previous else 1,
                        "session": session, "history": retained,
-                       "grants": grants, "legacy": legacy}
+                       "grants": grants, "legacy": legacy,
+                       "history_epoch": (previous.get("history_epoch", 0) if previous else 0)
+                                        + (1 if clear_command else 0),
+                       "history_clear": clear_command if clear_command else
+                                        (previous.get("history_clear") if previous else None)}
             signature = sign_node(self.node_private_key(), payload)
             self.db.execute(
                 "INSERT INTO owner_records VALUES(?,?,?,?,?) ON CONFLICT(pool_id,pc_id) "
@@ -251,6 +307,7 @@ class Store:
                 "signature=excluded.signature",
                 (snap["pool_id"], owner, payload["version"],
                  json.dumps(payload, separators=(",", ":")), signature))
+            self._sync_snapshot_history(snap["pool_id"], owner, retained)
             if session:
                 self.db.execute(
                     "INSERT INTO recovery_checkpoints VALUES(?,?,?,?,?,?) "
@@ -281,6 +338,12 @@ class Store:
                 return False
             if previous:
                 old = json.loads(previous[1])
+                old_epoch = int(old.get("history_epoch", 0))
+                new_epoch = int(payload.get("history_epoch", 0))
+                if new_epoch not in (old_epoch, old_epoch + 1):
+                    raise PermissionError("Invalid history generation.")
+                if new_epoch == old_epoch and payload.get("history_clear") != old.get("history_clear"):
+                    raise PermissionError("History clear proof changed unexpectedly.")
                 old_active = old["session"]
                 new_active = payload["session"]
                 new_history = {item["id"]: item for item in payload["history"]}
@@ -290,14 +353,38 @@ class Store:
                             raise PermissionError("Paid allocation cannot shrink.")
                     elif old_active["id"] not in new_history:
                         raise PermissionError("A completed session needs a history record.")
-                old_ids = [item["id"] for item in old["history"]]
-                if any(item not in new_history for item in old_ids[-19:]):
-                    raise PermissionError("Owner history cannot be erased.")
+                if new_epoch == old_epoch:
+                    old_ids = [item["id"] for item in old["history"]]
+                    new_ids = [item["id"] for item in payload["history"]]
+                    fresh = [item for item in new_ids if item not in old_ids]
+                    expected = (old_ids + fresh)[-HISTORY_PER_PC:]
+                    if new_ids != expected:
+                        raise PermissionError("Owner history is not FIFO append-only.")
+                elif payload["history"]:
+                    raise PermissionError("A clear record must start with empty history.")
+            elif int(payload.get("history_epoch", 0)) < 0:
+                raise PermissionError("Invalid history generation.")
             history_ids = [item["id"] for item in payload["history"]]
+            if len(history_ids) > HISTORY_PER_PC:
+                raise PermissionError("Owner history exceeds the retention limit.")
             if len(history_ids) != len(set(history_ids)):
                 raise PermissionError("Duplicate session history ID.")
             if payload["session"] and payload["session"]["id"] in history_ids:
                 raise PermissionError("A completed session cannot reopen.")
+            clear = payload.get("history_clear")
+            if int(payload.get("history_epoch", 0)) > 0 and not clear:
+                raise PermissionError("History clear lacks an Admin command.")
+            if clear:
+                command = clear["command"]
+                if (command["action"] != "clear_history" or command["target"] != owner
+                        or command["pool_id"] != snap["pool_id"]):
+                    raise PermissionError("Invalid history clear target.")
+                verify_node(snap["members"][command["admin_id"]]["public_key"],
+                            command, clear["signature"])
+                if not any(self._grant_proof_valid(key, command, clear)
+                           for key in snap.get("admin_signing_keys",
+                                               [snap["admin_signing"]["public"]])):
+                    raise PermissionError("History clear has no Admin proof.")
             # Paid allotments must be backed by signed Admin commands.
             grants_by_session: dict[str, int] = dict(payload.get("legacy", {}))
             baseline = {item["id"]: item["paid_minutes"] for item in
@@ -341,7 +428,18 @@ class Store:
                 "signature=excluded.signature",
                 (snap["pool_id"], owner, payload["version"],
                  json.dumps(payload, separators=(",", ":")), record["signature"]))
+            self._sync_snapshot_history(snap["pool_id"], owner, payload["history"])
             return True
+
+    def _sync_snapshot_history(self, pool_id: str, owner: str,
+                               history: list[dict]) -> None:
+        """Remove pruned/cleared copies from the replicated pool blob too."""
+        row = self.db.execute("SELECT snapshot FROM pools WHERE pool_id=?",
+                              (pool_id,)).fetchone()
+        raw = json.loads(row[0])
+        raw["history"][owner] = history[-HISTORY_PER_PC:]
+        self.db.execute("UPDATE pools SET snapshot=? WHERE pool_id=?",
+                        (json.dumps(raw, separators=(",", ":")), pool_id))
 
     @staticmethod
     def _grant_proof_valid(public_key: str, command: dict, grant: dict) -> bool:
@@ -389,6 +487,13 @@ class Store:
     def save_pool(self, snapshot: dict, secret: str, join: bool = False) -> None:
         """Save snapshot before changing membership; an old pool stays recoverable."""
         with self._lock, self.db:
+            snapshot = copy.deepcopy(snapshot)
+            self.prune_history(snapshot)
+            for (payload_text,) in self.db.execute(
+                    "SELECT payload FROM owner_records WHERE pool_id=?",
+                    (snapshot["pool_id"],)):
+                payload = json.loads(payload_text)
+                snapshot["history"][payload["pc_id"]] = payload["history"][-HISTORY_PER_PC:]
             self.db.execute(
                 "INSERT INTO pools(pool_id,revision,snapshot,secret) VALUES(?,?,?,?) "
                 "ON CONFLICT(pool_id) DO UPDATE SET revision=excluded.revision, "
@@ -581,10 +686,12 @@ class Store:
                 (action, json.dumps(payload or {}))
             )
 
-    def take_local_commands(self) -> list[tuple[str, dict]]:
+    def take_local_commands(self, limit: int | None = None) -> list[tuple[str, dict]]:
         with self._lock, self.db:
+            query = "SELECT id,action,payload FROM local_commands ORDER BY id"
             rows = self.db.execute(
-                "SELECT id,action,payload FROM local_commands ORDER BY id"
+                query + " LIMIT ?" if limit is not None else query,
+                (limit,) if limit is not None else (),
             ).fetchall()
             if rows:
                 self.db.execute("DELETE FROM local_commands WHERE id<=?", (rows[-1][0],))

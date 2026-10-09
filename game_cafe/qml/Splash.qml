@@ -3,19 +3,21 @@ import QtQuick.Controls
 import QtQuick.Layouts
 
 Item {
-    Rectangle { anchors.fill: parent; color: "#101c2b" }
+    id: splash
+    readonly property int brandSize: Math.min(420, Math.max(170, Math.min(width * 0.23, height * 0.32)))
+    Rectangle { anchors.fill: parent; color: "#0B1120" }
     ColumnLayout {
         anchors.centerIn: parent
         spacing: 24
         RowLayout {
             Layout.alignment: Qt.AlignHCenter; spacing: 22
-            Avatar { diameter: 86 }
-            Rectangle { width: 1; height: 72; color: "#466070" }
-            Text { text: "StickForYou"; color: "#f5fbff"; font.pixelSize: 28; font.bold: true }
+            Avatar { diameter: Math.round(splash.brandSize * 0.65) }
+            Rectangle { width: 1; height: splash.brandSize * 0.7; color: "#455C73" }
+            BrandLogo { Layout.preferredWidth: splash.brandSize; Layout.preferredHeight: splash.brandSize }
         }
-        Text { text: "GAME CAFE CONSOLE"; color: "#f6fbff"; font.pixelSize: 30; font.bold: true; Layout.alignment: Qt.AlignHCenter }
-        Text { text: "Powered by StickForYou"; color: "#35c7c7"; font.pixelSize: 15; Layout.alignment: Qt.AlignHCenter }
-        Text { text: bridge.statusText; color: "#89a5b8"; font.pixelSize: 16; Layout.alignment: Qt.AlignHCenter }
+        Text { text: "GAMEGRID"; color: "#F4F7FB"; font.pixelSize: 30; font.bold: true; Layout.alignment: Qt.AlignHCenter }
+        Text { text: "Powered by StickForYou"; color: "#64BCC1"; font.pixelSize: 15; Layout.alignment: Qt.AlignHCenter }
+        Text { text: bridge.statusText; color: "#A8B8CA"; font.pixelSize: 16; Layout.alignment: Qt.AlignHCenter }
         BusyIndicator { running: bridge.busy; Layout.alignment: Qt.AlignHCenter }
         ActionButton { text: "Retry"; visible: !bridge.busy; Layout.alignment: Qt.AlignHCenter; onClicked: bridge.begin() }
     }

@@ -10,17 +10,17 @@ ApplicationWindow {
     height: 680
     minimumWidth: 720
     minimumHeight: 560
-    title: "Game Cafe Console"
-    color: "#101c2b"
+    title: "GameGrid"
+    color: "#0B1120"
     Material.theme: Material.Dark
-    Material.accent: "#35c7c7"
+    Material.accent: "#D85288"
     property var confirmation: ({})
     property var notice: bridge.notice
     function ask(title, message, label, action) {
         confirmation = ({ title: title, message: message, label: label, action: action })
     }
     function confirmAdminExit() {
-        ask("Exit Game Cafe Console",
+        ask("Exit GameGrid",
             "Exiting disconnects this Admin PC. Existing sessions on other User PCs will continue independently.",
             "Exit Application", function() { bridge.closeAdmin() })
     }
@@ -63,20 +63,20 @@ ApplicationWindow {
             if (root.notice.title) bridge.clearNotice()
             else root.cancelConfirmation()
         }
-        Rectangle { anchors.fill: parent; color: "#ba07111d" }
+        Rectangle { anchors.fill: parent; color: "#BF080D18" }
         MouseArea { anchors.fill: parent }
         Panel {
             width: Math.min(parent.width - 40, 490)
             height: modalColumn.implicitHeight + 48
             anchors.centerIn: parent
-            border.color: root.notice.error ? "#c56a7a" : "#35c7c7"
+            border.color: root.notice.error ? "#D16C83" : "#64BCC1"
             ColumnLayout {
                 id: modalColumn
                 anchors.fill: parent
                 anchors.margins: 24
                 spacing: 18
-                Text { text: root.notice.title || root.confirmation.title || ""; color: "#f6fbff"; font.pixelSize: 22; font.bold: true; Layout.fillWidth: true; wrapMode: Text.WordWrap }
-                Text { text: root.notice.message || root.confirmation.message || ""; color: "#b9c9d6"; font.pixelSize: 14; Layout.fillWidth: true; wrapMode: Text.WordWrap }
+                Text { text: root.notice.title || root.confirmation.title || ""; color: "#F4F7FB"; font.pixelSize: 22; font.bold: true; Layout.fillWidth: true; wrapMode: Text.WordWrap }
+                Text { text: root.notice.message || root.confirmation.message || ""; color: "#A8B8CA"; font.pixelSize: 14; Layout.fillWidth: true; wrapMode: Text.WordWrap }
                 RowLayout {
                     Layout.alignment: Qt.AlignRight
                     spacing: 10

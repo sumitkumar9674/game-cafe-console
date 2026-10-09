@@ -87,14 +87,14 @@ class CafeBridge(QObject):
         self.runtime = runtime
         self.child = child
         self._mode = "console" if child else "splash"
-        self._view: dict = {"cafeName": "Game Cafe Console", "hasAvatar": False,
+        self._view: dict = {"cafeName": "GameGrid", "hasAvatar": False,
                             "avatarSource": "", "developer": DEVELOPER_NAME,
                             "brand": DEVELOPER_BRAND, "website": DEVELOPER_WEBSITE,
                             "email": DEVELOPER_EMAIL,
                             "appLogoSource": app_logo_source(),
                             "adminLoginFailed": False,
                             "activeAdminDetected": False}
-        self._status = "Starting Game Cafe Console"
+        self._status = "Starting GameGrid"
         self._notice: dict = {}
         self._busy = False
         self._selected_pc = ""

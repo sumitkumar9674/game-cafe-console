@@ -5,6 +5,7 @@ import QtQuick.Layouts
 Item {
     id: page
     objectName: "adminPage"
+    Theme { id: theme }
     property string section: "Dashboard"
     property string startKind: "timed"
     property string addValue: "15"
@@ -28,11 +29,13 @@ Item {
         Rectangle {
             Layout.preferredWidth: 220
             Layout.fillHeight: true
-            color: "#142235"
+            color: "#111B2B"
             ColumnLayout {
                 anchors.fill: parent; anchors.margins: 18; spacing: 16
-                RowLayout { Avatar { diameter: 48 } Text { text: "GAME CAFE\nCONSOLE"; color: "#f4fbfd"; font.bold: true; font.pixelSize: 16 } }
-                Text { text: bridge.view.cafeName || "Cafe"; color: "#89a5b8"; font.pixelSize: 13; elide: Text.ElideRight; Layout.fillWidth: true }
+                RowLayout { Layout.fillWidth: true
+                    Avatar { objectName: "adminCafeAvatar"; diameter: 78 }
+                }
+                Text { objectName: "adminCafeName"; text: bridge.view.cafeName || "Cafe"; color: "#A8B8CA"; font.pixelSize: 13; elide: Text.ElideRight; Layout.fillWidth: true }
                 Repeater {
                     model: ["Dashboard", "Computers", "Connections", "History", "Settings", "About"]
                     delegate: ActionButton {
@@ -43,9 +46,9 @@ Item {
                     }
                 }
                 Item { Layout.fillHeight: true }
-                Text { text: (bridge.view.onlineCount || 0) + " / " + (bridge.view.totalCount || 0) + " PCs online"; color: "#91a7ba" }
-                Text { text: "LOCAL NETWORK"; color: "#35c7c7"; font.bold: true; font.pixelSize: 11 }
-                Text { text: "Developed by Sumit Kumar · StickForYou"; color: "#7892a4"; font.pixelSize: 10; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                Text { text: (bridge.view.onlineCount || 0) + " / " + (bridge.view.totalCount || 0) + " PCs online"; color: "#A8B8CA" }
+                Text { text: "LOCAL NETWORK"; color: "#64BCC1"; font.bold: true; font.pixelSize: 11 }
+                Text { text: "Developed by Sumit Kumar · StickForYou"; color: "#8398AC"; font.pixelSize: 10; wrapMode: Text.WordWrap; Layout.fillWidth: true }
             }
         }
         ColumnLayout {
@@ -54,11 +57,11 @@ Item {
             RowLayout {
                 Layout.fillWidth: true
                 ColumnLayout { Layout.fillWidth: true
-                    Text { text: page.section; color: "#f6fbff"; font.pixelSize: 29; font.bold: true }
-                    Text { text: bridge.view.cafeName || "Game Cafe Console"; color: "#8daabd" }
+                    Text { text: page.section; color: "#F4F7FB"; font.pixelSize: 29; font.bold: true }
+                    Text { text: bridge.view.cafeName || "GameGrid"; color: "#A8B8CA" }
                 }
                 Item { Layout.fillWidth: true }
-                Text { text: bridge.busy ? "Working…" : "● Live"; color: "#35c7c7"; font.bold: true }
+                Text { text: bridge.busy ? "Working…" : "● Live"; color: "#64BCC1"; font.bold: true }
             }
             RowLayout {
                 visible: page.section === "Dashboard"
@@ -70,8 +73,8 @@ Item {
                     Panel {
                         Layout.fillWidth: true; implicitHeight: 90
                         ColumnLayout { anchors.fill: parent; anchors.margins: 14
-                            Text { text: modelData.label; color: "#8ca7ba"; font.pixelSize: 13 }
-                            Text { text: modelData.value; color: "#f4fafc"; font.pixelSize: 25; font.bold: true }
+                            Text { text: modelData.label; color: "#A8B8CA"; font.pixelSize: 13 }
+                            Text { text: modelData.value; color: "#F4F7FB"; font.pixelSize: 25; font.bold: true }
                         }
                         MouseArea { anchors.fill: parent; enabled: modelData.label === "Unlock requests"; onClicked: bridge.selectFirstUnlock() }
                     }
@@ -87,8 +90,8 @@ Item {
                         anchors.fill: parent; anchors.margins: 14; spacing: 10
                         RowLayout {
                             Layout.fillWidth: true
-                            Text { text: "ALL COMPUTERS"; color: "#aac3d0"; font.bold: true; font.pixelSize: 12; Layout.fillWidth: true }
-                            Text { text: "SORT BY"; color: "#7892a4"; font.bold: true; font.pixelSize: 10 }
+                            Text { text: "ALL COMPUTERS"; color: "#BED1DA"; font.bold: true; font.pixelSize: 12; Layout.fillWidth: true }
+                            Text { text: "SORT BY"; color: "#8398AC"; font.bold: true; font.pixelSize: 10 }
                             DarkComboBox {
                                 objectName: "computerSortBox"
                                 model: ["Recent", "Name (A–Z)"]
@@ -108,7 +111,8 @@ Item {
                                 required property var rowData
                                 width: pcList.width - 8
                                 implicitHeight: bridge.expandedPcId === rowData.pcId ? detailColumn.implicitHeight + 24 : 90
-                                color: rowData.unlockRequested ? "#354238" : bridge.selectedPcId === rowData.pcId ? "#203a4a" : "#1b2b3c"
+                                color: rowData.unlockRequested ? "#374837" : bridge.selectedPcId === rowData.pcId ? "#29445B" : "#1B2B40"
+                                border.color: bridge.selectedPcId === rowData.pcId ? theme.accent : rowData.unlockRequested ? theme.success : theme.panelBorder
                                 Behavior on implicitHeight { NumberAnimation { duration: 170; easing.type: Easing.OutCubic } }
                                 MouseArea { anchors.fill: parent; onClicked: bridge.selectPc(card.rowData.pcId) }
                                 ColumnLayout {
@@ -118,25 +122,25 @@ Item {
                                     RowLayout {
                                         Layout.fillWidth: true
                                         ColumnLayout { Layout.fillWidth: true
-                                            Text { text: card.rowData.name; color: "#f7fbfd"; font.pixelSize: 17; font.bold: true }
-                                            Text { text: card.rowData.role + "  ·  " + (card.rowData.online ? "ONLINE" : "OFFLINE") + "  ·  " + card.rowData.access; color: card.rowData.online ? "#51d9bc" : "#91a3b3"; font.pixelSize: 11 }
+                                            Text { text: card.rowData.name; color: "#F4F7FB"; font.pixelSize: 17; font.bold: true }
+                                            Text { text: card.rowData.role + "  ·  " + (card.rowData.online ? "ONLINE" : "OFFLINE") + "  ·  " + card.rowData.access; color: card.rowData.online ? "#A4B36A" : "#A8B8CA"; font.pixelSize: 11 }
                                         }
                                         Item { Layout.fillWidth: true }
-                                        Text { text: card.rowData.timeText; color: "#35c7c7"; font.pixelSize: 19; font.bold: true }
+                                        Text { objectName: "adminSessionTimer"; text: card.rowData.timeText; color: card.rowData.phase === "BUFFER" ? theme.buffer : card.rowData.phase === "PAUSED" ? theme.paused : card.rowData.phase === "GRACE" || card.rowData.phase === "EXPIRED" ? theme.grace : theme.active; font.pixelSize: 19; font.bold: true }
                                     }
-                                    Text { text: card.rowData.player + "  ·  " + (card.rowData.kind === "none" ? "No session" : card.rowData.kind) + "  ·  " + card.rowData.detail; color: "#a8bfce"; font.pixelSize: 12; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                                    Text { text: card.rowData.player + "  ·  " + (card.rowData.kind === "none" ? "No session" : card.rowData.kind) + "  ·  " + card.rowData.detail; color: "#A8B8CA"; font.pixelSize: 12; wrapMode: Text.WordWrap; Layout.fillWidth: true }
                                     ColumnLayout {
                                         visible: bridge.expandedPcId === card.rowData.pcId
                                         Layout.fillWidth: true; spacing: 9
-                                        Text { text: "PLAYER  " + card.rowData.player + "    ·    " + card.rowData.phase; color: "#f1f7f9"; font.pixelSize: 12 }
-                                        Text { text: "Started " + card.rowData.startedText; color: "#91a7ba"; visible: card.rowData.startedText !== ""; font.pixelSize: 12 }
+                                        Text { text: "PLAYER  " + card.rowData.player + "    ·    " + card.rowData.phase; color: "#F4F7FB"; font.pixelSize: 12 }
+                                        Text { text: "Started " + card.rowData.startedText; color: "#A8B8CA"; visible: card.rowData.startedText !== ""; font.pixelSize: 12 }
                                         RowLayout {
                                             visible: card.rowData.start
-                                            Text { text: "Initial player: Guest"; color: "#a9c0cf"; font.pixelSize: 12 }
+                                            Text { text: "Initial player: Guest"; color: "#A8B8CA"; font.pixelSize: 12 }
                                         }
                                         RowLayout {
                                             visible: card.rowData.start
-                                            Text { text: "Session"; color: "#a9c0cf" }
+                                            Text { text: "Session"; color: "#A8B8CA" }
                                             DarkComboBox { id: kindBox; model: ["Timed", "No timer"]; Layout.preferredWidth: 110 }
                                             DarkComboBox { id: paidField; model: ["15", "30", "60", "120", "Custom Minutes"]; currentIndex: 2; visible: kindBox.currentIndex === 0; Layout.preferredWidth: 145 }
                                             TextField { id: customPaid; visible: kindBox.currentIndex === 0 && paidField.currentIndex === 4; placeholderText: "Minutes"; Layout.preferredWidth: 88; inputMethodHints: Qt.ImhDigitsOnly }
@@ -185,15 +189,15 @@ Item {
                                                     })
                                                 }
                                             }
-                                            Text { text: "Unlock requested"; color: "#f1bb70"; visible: card.rowData.unlockRequested }
+                                            Text { text: "Unlock requested"; color: "#F2A65A"; visible: card.rowData.unlockRequested }
                                         }
                                         ActionButton { text: "Exit Software"; danger: true; visible: card.rowData.exitSoftware; onClicked: {
                                             var pcId = card.rowData.pcId
                                             root.ask("Exit software on " + card.rowData.name,
-                                                "Game Cafe Console will close on this PC" + (card.rowData.end ? " and its active session will end" : "") + ". The Windows desktop may then be accessible without cafe enforcement. Continue?",
+                                                "GameGrid will close on this PC" + (card.rowData.end ? " and its active session will end" : "") + ". The Windows desktop may then be accessible without cafe enforcement. Continue?",
                                                 "Continue", function(){
                                                     if (card.rowData.end) {
-                                                        root.ask("Final confirmation", "End the session on " + card.rowData.name + " and exit Game Cafe Console?", "Exit Software", function(){ bridge.exitRemoteSoftware(pcId) })
+                                                        root.ask("Final confirmation", "End the session on " + card.rowData.name + " and exit GameGrid?", "Exit Software", function(){ bridge.exitRemoteSoftware(pcId) })
                                                     } else {
                                                         bridge.exitRemoteSoftware(pcId)
                                                     }
@@ -212,7 +216,7 @@ Item {
                     Layout.maximumWidth: 235
                     Layout.fillHeight: true
                     ColumnLayout { anchors.fill: parent; anchors.margins: 15; spacing: 10
-                        Text { text: "RECENT SESSIONS"; color: "#aac3d0"; font.bold: true; font.pixelSize: 12; Layout.fillWidth: true }
+                        Text { text: "RECENT SESSIONS"; color: "#BED1DA"; font.bold: true; font.pixelSize: 12; Layout.fillWidth: true }
                         ListView { id: historySide; Layout.fillWidth: true; Layout.fillHeight: true; clip: true; model: bridge.dashboardHistoryModel; spacing: 8
                             Text {
                                 objectName: "recentHistoryEmptyState"
@@ -221,15 +225,15 @@ Item {
                                 horizontalAlignment: Text.AlignHCenter
                                 wrapMode: Text.WordWrap
                                 text: bridge.selectedPcId ? "No sessions recorded for this PC." : "Select a computer to view recent sessions."
-                                color: "#718ca0"
+                                color: "#8398AC"
                                 visible: historySide.count === 0
                                 font.pixelSize: 12
                             }
-                            delegate: Rectangle { required property var rowData; width: historySide.width; height: 84; radius: 9; color: "#223448"
+                            delegate: Rectangle { required property var rowData; width: historySide.width; height: 84; radius: 9; color: "#253C54"
                                 Column { anchors.fill: parent; anchors.margins: 9; spacing: 3
-                                    Text { text: rowData.pcName; color: "#f2f8fa"; font.bold: true }
-                                    Text { text: rowData.player; color: "#96acbd"; font.pixelSize: 12 }
-                                    Text { text: rowData.duration; color: "#35c7c7"; font.pixelSize: 12; font.bold: true }
+                                    Text { text: rowData.pcName; color: "#F4F7FB"; font.bold: true }
+                                    Text { text: rowData.player; color: "#A8B8CA"; font.pixelSize: 12 }
+                                    Text { text: rowData.duration; color: "#64BCC1"; font.pixelSize: 12; font.bold: true }
                                 }
                             }
                         }
@@ -246,21 +250,21 @@ Item {
         id: connections
         ScrollView { contentWidth: availableWidth
             ColumnLayout { width: parent.width; spacing: 14
-                Panel { Layout.fillWidth: true; implicitHeight: 72; color: "#203a4a"
+                Panel { Layout.fillWidth: true; implicitHeight: 72; color: "#29445B"
                     Column { anchors.fill: parent; anchors.margins: 14; spacing: 5
-                        Text { text: "PENDING JOIN REQUESTS"; color: "#f4fbff"; font.bold: true; font.pixelSize: 17 }
-                        Text { text: (bridge.view.pendingCount || 0) + " awaiting approval"; color: "#35c7c7" }
+                        Text { text: "PENDING JOIN REQUESTS"; color: "#F4F7FB"; font.bold: true; font.pixelSize: 17 }
+                        Text { text: (bridge.view.pendingCount || 0) + " awaiting approval"; color: "#64BCC1" }
                     }
                 }
-                Panel { Layout.fillWidth: true; implicitHeight: 70; visible: (bridge.view.pendingCount || 0) === 0; color: "#1b2b3c"
-                    Text { anchors.centerIn: parent; text: "No pending join requests"; color: "#91a9ba" }
+                Panel { Layout.fillWidth: true; implicitHeight: 70; visible: (bridge.view.pendingCount || 0) === 0; color: "#1B2B40"
+                    Text { anchors.centerIn: parent; text: "No pending join requests"; color: "#A8B8CA" }
                 }
                 Repeater { model: bridge.joinModel
                     Panel { required property var rowData; Layout.fillWidth: true; implicitHeight: 110
                         RowLayout { anchors.fill: parent; anchors.margins: 15
                             ColumnLayout { Layout.fillWidth: true
-                                Text { text: rowData.name; color: "#f4fbff"; font.bold: true }
-                                Text { text: rowData.ip + " · " + rowData.pcId; color: "#91a9ba"; font.pixelSize: 11 }
+                                Text { text: rowData.name; color: "#F4F7FB"; font.bold: true }
+                                Text { text: rowData.ip + " · " + rowData.pcId; color: "#A8B8CA"; font.pixelSize: 11 }
                             }
                             TextField { id: code; placeholderText: "7-character code"; Layout.preferredWidth: 125; maximumLength: 7 }
                             TextField { id: approvedName; text: rowData.name; Layout.preferredWidth: 145 }
@@ -276,17 +280,17 @@ Item {
                         }
                     }
                 }
-                Panel { Layout.fillWidth: true; implicitHeight: 72; color: "#203a4a"
+                Panel { Layout.fillWidth: true; implicitHeight: 72; color: "#29445B"
                     Column { anchors.fill: parent; anchors.margins: 14; spacing: 5
-                        Text { text: "REGISTERED COMPUTERS"; color: "#f4fbff"; font.bold: true; font.pixelSize: 17 }
-                        Text { text: (bridge.view.totalCount || 0) + " known devices"; color: "#35c7c7" }
+                        Text { text: "REGISTERED COMPUTERS"; color: "#F4F7FB"; font.bold: true; font.pixelSize: 17 }
+                        Text { text: (bridge.view.totalCount || 0) + " known devices"; color: "#64BCC1" }
                     }
                 }
                 Repeater { model: bridge.memberModel
                     Panel { required property var rowData; Layout.fillWidth: true; implicitHeight: 72
                         RowLayout { anchors.fill: parent; anchors.margins: 12
-                            Text { text: rowData.online ? "●" : "○"; color: rowData.online ? "#35c7c7" : "#91a9ba" }
-                            Text { text: rowData.name; color: "#f4fbff"; Layout.fillWidth: true }
+                            Text { text: rowData.online ? "●" : "○"; color: rowData.online ? "#64BCC1" : "#A8B8CA" }
+                            Text { text: rowData.name; color: "#F4F7FB"; Layout.fillWidth: true }
                             TextField { id: newName; placeholderText: "Rename PC"; Layout.preferredWidth: 170 }
                             ActionButton { text: "Save name"; secondary: true; onClicked: bridge.renamePc(rowData.pcId,newName.text) }
                         }
@@ -297,18 +301,18 @@ Item {
     }
     Component { id: historyFull
         Panel { ColumnLayout { anchors.fill: parent; anchors.margins: 16
-            RowLayout { Text { text: "Session history"; color: "#f4fbff"; font.pixelSize: 19; Layout.fillWidth: true }
+            RowLayout { Text { text: "Session history"; color: "#F4F7FB"; font.pixelSize: 19; Layout.fillWidth: true }
                 ActionButton { objectName: "allHistoryButton"; text: "All PCs"; secondary: true; onClicked: bridge.showAllHistory() }
             }
             ListView { id: fullHistory; Layout.fillWidth: true; Layout.fillHeight: true; model: bridge.historyModel; clip: true; spacing: 7
-                Text { anchors.centerIn: parent; text: "No completed sessions yet"; color: "#718ca0"; visible: fullHistory.count === 0 }
-                delegate: Rectangle { required property var rowData; width: fullHistory.width; height: 72; radius: 8; color: "#223448"
+                Text { anchors.centerIn: parent; text: "No completed sessions yet"; color: "#8398AC"; visible: fullHistory.count === 0 }
+                delegate: Rectangle { required property var rowData; width: fullHistory.width; height: 72; radius: 8; color: "#253C54"
                     RowLayout { anchors.fill: parent; anchors.margins: 12
                         ColumnLayout { Layout.fillWidth: true
-                            Text { text: rowData.pcName + "  ·  " + rowData.player; color: "#f3fafc"; font.bold: true }
-                            Text { text: rowData.started + " → " + rowData.ended; color: "#91a9ba"; font.pixelSize: 11 }
+                            Text { text: rowData.pcName + "  ·  " + rowData.player; color: "#F4F7FB"; font.bold: true }
+                            Text { text: rowData.started + " → " + rowData.ended; color: "#A8B8CA"; font.pixelSize: 11 }
                         }
-                        Text { text: rowData.kind + " · " + rowData.duration + " · " + (rowData.kind === "timed" ? rowData.paidMinutes + " paid min · " : "") + rowData.reason; color: "#35c7c7" }
+                        Text { text: rowData.kind + " · " + rowData.duration + " · " + (rowData.kind === "timed" ? rowData.paidMinutes + " paid min · " : "") + rowData.reason; color: "#64BCC1" }
                     }
                 }
             }
@@ -319,7 +323,7 @@ Item {
             ColumnLayout { width: Math.min(parent.width, 700); spacing: 15
                 Panel { Layout.fillWidth: true; implicitHeight: historyManagement.implicitHeight + 34
                     ColumnLayout { id: historyManagement; anchors.fill: parent; anchors.margins: 17; spacing: 10
-                        Text { text: "History Management"; color: "#f4fbff"; font.pixelSize: 19; font.bold: true }
+                        Text { text: "History Management"; color: "#F4F7FB"; font.pixelSize: 19; font.bold: true }
                         DarkComboBox {
                             id: historyPc
                             objectName: "historyPcSelector"
@@ -333,8 +337,8 @@ Item {
                                 root.cancelConfirmation()
                             }
                         }
-                        Text { text: page.historyTarget() ? (page.historyTarget().count > 0 ? page.historyTarget().name + " · " + page.historyTarget().count + " completed sessions" : "No completed sessions for this PC.") : "Choose one registered computer."; color: "#91a9ba" }
-                        Text { visible: !!page.historyTarget() && !page.historyTarget().online; text: "This PC must reconnect before its history can be cleared."; color: "#f0b66c"; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                        Text { text: page.historyTarget() ? (page.historyTarget().count > 0 ? page.historyTarget().name + " · " + page.historyTarget().count + " completed sessions" : "No completed sessions for this PC.") : "Choose one registered computer."; color: "#A8B8CA" }
+                        Text { visible: !!page.historyTarget() && !page.historyTarget().online; text: "This PC must reconnect before its history can be cleared."; color: "#F2A65A"; wrapMode: Text.WordWrap; Layout.fillWidth: true }
                         ActionButton {
                             objectName: "clearSelectedHistory"
                             text: "Clear History"
@@ -364,19 +368,19 @@ Item {
                 }
                 Panel { Layout.fillWidth: true; implicitHeight: identity.implicitHeight + 34
                     ColumnLayout { id: identity; anchors.fill: parent; anchors.margins: 17; spacing: 10
-                        Text { text: "Cafe identity"; color: "#f4fbff"; font.pixelSize: 19; font.bold: true }
+                        Text { text: "Cafe identity"; color: "#F4F7FB"; font.pixelSize: 19; font.bold: true }
                         TextField { id: cafeName; text: bridge.view.settings ? bridge.view.settings.cafeName : ""; placeholderText: "Cafe name"; Layout.fillWidth: true }
                         TextField { id: adminName; text: bridge.view.settings ? bridge.view.settings.adminName : ""; placeholderText: "Admin name"; Layout.fillWidth: true }
                         RowLayout { TextField { id: grace; text: bridge.view.settings ? String(bridge.view.settings.graceMinutes) : "10"; placeholderText: "Grace min"; Layout.fillWidth: true }
                             TextField { id: signout; text: bridge.view.settings ? String(bridge.view.settings.signoutMinutes) : "0"; placeholderText: "Auto signout min"; Layout.fillWidth: true }
                         }
-                        Text { text: "Automatic Windows sign-out is disabled pending recovery design."; color: "#91a9ba"; font.pixelSize: 11 }
+                        Text { text: "Automatic Windows sign-out is disabled pending recovery design."; color: "#A8B8CA"; font.pixelSize: 11 }
                         ActionButton { text: "Save settings"; onClicked: bridge.saveSettings(cafeName.text,adminName.text,grace.text,signout.text) }
                     }
                 }
                 Panel { Layout.fillWidth: true; implicitHeight: avatarSettings.implicitHeight + 34
                     ColumnLayout { id: avatarSettings; anchors.fill: parent; anchors.margins: 17; spacing: 10
-                        Text { text: "Cafe avatar"; color: "#f4fbff"; font.pixelSize: 19; font.bold: true }
+                        Text { text: "Cafe avatar"; color: "#F4F7FB"; font.pixelSize: 19; font.bold: true }
                         RowLayout {
                             AvatarPreview {
                                 objectName: "avatarPreview"
@@ -390,8 +394,8 @@ Item {
                                 Layout.maximumHeight: 184
                             }
                             ColumnLayout {
-                                Text { text: "PNG or JPG · up to 5 MB"; color: "#91a9ba" }
-                                Text { text: "Preview fit"; color: "#91a9ba"; font.pixelSize: 12 }
+                                Text { text: "PNG or JPG · up to 5 MB"; color: "#A8B8CA" }
+                                Text { text: "Preview fit"; color: "#A8B8CA"; font.pixelSize: 12 }
                                 DarkComboBox { id: avatarFit; objectName: "avatarPreviewFit"; model: ["Fit", "Fill"] }
                             }
                         }
@@ -402,15 +406,15 @@ Item {
                         }
                         DropArea { Layout.fillWidth: true; Layout.preferredHeight: 48
                             onDropped: function(drop) { if (drop.hasUrls && drop.urls.length) avatarPath.text = drop.urls[0] }
-                            Rectangle { anchors.fill: parent; radius: 8; color: "#263a4b"; border.color: "#3c5264"
-                                Text { anchors.centerIn: parent; text: "Drop a PNG or JPG here"; color: "#91a9ba" }
+                            Rectangle { anchors.fill: parent; radius: 8; color: "#203348"; border.color: "#455C73"
+                                Text { anchors.centerIn: parent; text: "Drop a PNG or JPG here"; color: "#A8B8CA" }
                             }
                         }
                     }
                 }
                 Panel { Layout.fillWidth: true; implicitHeight: security.implicitHeight + 34
                     ColumnLayout { id: security; anchors.fill: parent; anchors.margins: 17; spacing: 10
-                        Text { text: "Admin security"; color: "#f4fbff"; font.pixelSize: 19; font.bold: true }
+                        Text { text: "Admin security"; color: "#F4F7FB"; font.pixelSize: 19; font.bold: true }
                         TextField { id: oldPassword; placeholderText: "Current password"; echoMode: TextInput.Password; Layout.fillWidth: true }
                         TextField { id: newPassword; placeholderText: "New password"; echoMode: TextInput.Password; Layout.fillWidth: true }
                         TextField { id: confirmPassword; placeholderText: "Confirm new password"; echoMode: TextInput.Password; Layout.fillWidth: true }
@@ -419,8 +423,8 @@ Item {
                 }
                 Panel { Layout.fillWidth: true; implicitHeight: move.implicitHeight + 34
                     ColumnLayout { id: move; anchors.fill: parent; anchors.margins: 17; spacing: 10
-                        Text { text: "Change cafe"; color: "#f4fbff"; font.pixelSize: 19; font.bold: true }
-                        Text { text: "Discover and request to join another cafe. Your old cafe remains until approval."; color: "#91a9ba"; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                        Text { text: "Change cafe"; color: "#F4F7FB"; font.pixelSize: 19; font.bold: true }
+                        Text { text: "Discover and request to join another cafe. Your old cafe remains until approval."; color: "#A8B8CA"; wrapMode: Text.WordWrap; Layout.fillWidth: true }
                         TextField { id: movePassword; placeholderText: "Admin password"; echoMode: TextInput.Password; Layout.fillWidth: true }
                         ActionButton { text: "Find cafes"; onClicked: bridge.searchOtherPools(movePassword.text) }
                         Repeater { model: bridge.view.otherPools || []
@@ -434,12 +438,16 @@ Item {
     }
     Component { id: about
         Panel { ColumnLayout { anchors.fill: parent; anchors.margins: 24; spacing: 12
-            Avatar { diameter: 70 }
-            Text { text: "Game Cafe Console"; color: "#f4fbff"; font.pixelSize: 25; font.bold: true }
-            Text { text: "A local-first gaming cafe management console."; color: "#91a9ba" }
-            Text { text: "Developed by " + bridge.view.developer + " · " + bridge.view.brand; color: "#f1f8fa" }
-            Text { text: bridge.view.website; color: "#35c7c7"; MouseArea { anchors.fill: parent; onClicked: Qt.openUrlExternally(bridge.view.website) } }
-            Text { text: bridge.view.email; color: "#35c7c7"; MouseArea { anchors.fill: parent; onClicked: Qt.openUrlExternally("mailto:" + bridge.view.email) } }
+            RowLayout {
+                spacing: 18
+                BrandLogo { Layout.preferredWidth: 180; Layout.preferredHeight: 180 }
+                Avatar { diameter: 70 }
+            }
+            Text { text: "GameGrid"; color: theme.text; font.pixelSize: 25; font.bold: true }
+            Text { text: "A local-first gaming cafe management console."; color: "#A8B8CA" }
+            Text { text: "Developed by " + bridge.view.developer + " · " + bridge.view.brand; color: "#F4F7FB" }
+            Text { text: bridge.view.website; color: "#64BCC1"; MouseArea { anchors.fill: parent; onClicked: Qt.openUrlExternally(bridge.view.website) } }
+            Text { text: bridge.view.email; color: "#64BCC1"; MouseArea { anchors.fill: parent; onClicked: Qt.openUrlExternally("mailto:" + bridge.view.email) } }
             Item { Layout.fillHeight: true }
         } }
     }

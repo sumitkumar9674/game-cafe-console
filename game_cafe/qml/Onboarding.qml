@@ -25,8 +25,8 @@ Item {
             spacing: 18
             Item { Layout.preferredHeight: 25 }
             Avatar { diameter: 74; Layout.alignment: Qt.AlignHCenter }
-            Text { text: "WELCOME TO GAME CAFE CONSOLE"; color: "#f5fbff"; font.pixelSize: 26; font.bold: true; Layout.alignment: Qt.AlignHCenter }
-            Text { text: bridge.statusText; color: "#91a7ba"; Layout.alignment: Qt.AlignHCenter }
+            Text { text: "WELCOME TO GAMEGRID"; color: "#F4F7FB"; font.pixelSize: 26; font.bold: true; Layout.alignment: Qt.AlignHCenter }
+            Text { text: bridge.statusText; color: "#A8B8CA"; Layout.alignment: Qt.AlignHCenter }
             RowLayout {
                 Layout.alignment: Qt.AlignHCenter
                 ActionButton { text: "Discover"; secondary: page.tab !== "discover"; visible: bridge.mode !== "candidate"; onClicked: page.tab = "discover" }
@@ -42,9 +42,9 @@ Item {
                     anchors.fill: parent
                     anchors.margins: 21
                     spacing: 12
-                    Text { objectName: "loginRoleHeading"; text: page.tab === "create" ? "Create a local cafe" : page.tab === "admin" ? "Claim Admin role" : page.tab === "user" ? "Continue as User" : "Nearby cafes"; color: "#f3f9fb"; font.pixelSize: 20; font.bold: true }
-                    Text { text: "Your cafe runs on your local network."; color: "#91a7ba"; visible: page.tab === "create" }
-                    Text { objectName: "activeAdminMessage"; text: "An Admin is already active for this cafe. Continue as User."; color: "#91a7ba"; visible: bridge.mode === "candidate" && bridge.view.activeAdminDetected; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                    Text { objectName: "loginRoleHeading"; text: page.tab === "create" ? "Create a local cafe" : page.tab === "admin" ? "Claim Admin role" : page.tab === "user" ? "Continue as User" : "Nearby cafes"; color: "#F4F7FB"; font.pixelSize: 20; font.bold: true }
+                    Text { text: "Your cafe runs on your local network."; color: "#A8B8CA"; visible: page.tab === "create" }
+                    Text { objectName: "activeAdminMessage"; text: "An Admin is already active for this cafe. Continue as User."; color: "#A8B8CA"; visible: bridge.mode === "candidate" && bridge.view.activeAdminDetected; wrapMode: Text.WordWrap; Layout.fillWidth: true }
                     TextField { id: cafe; placeholderText: "Cafe name"; Layout.fillWidth: true; visible: page.tab === "create" }
                     TextField { id: pc; placeholderText: "This PC name"; Layout.fillWidth: true; visible: page.tab === "create" }
                     TextField { id: admin; placeholderText: "Admin name"; Layout.fillWidth: true; visible: page.tab === "create" }
@@ -69,15 +69,15 @@ Item {
                             RowLayout {
                                 anchors.fill: parent; anchors.margins: 12
                                 ColumnLayout { Layout.fillWidth: true
-                                    Text { text: modelData.cafeName; color: "#f5fbff"; font.bold: true }
-                                    Text { text: modelData.ip; color: "#91a7ba" }
+                                    Text { text: modelData.cafeName; color: "#F4F7FB"; font.bold: true }
+                                    Text { text: modelData.ip; color: "#A8B8CA" }
                                 }
                                 TextField { id: joinName; placeholderText: "Your PC name"; Layout.preferredWidth: 170 }
                                 ActionButton { text: "Request to join"; onClicked: bridge.startJoin(modelData.poolId, joinName.text) }
                             }
                         }
                     }
-                    Text { text: "No cafes found yet. Search again or create one."; color: "#91a7ba"; visible: page.tab === "discover" && (!bridge.view.pools || bridge.view.pools.length === 0) }
+                    Text { text: "No cafes found yet. Search again or create one."; color: "#A8B8CA"; visible: page.tab === "discover" && (!bridge.view.pools || bridge.view.pools.length === 0) }
                 }
             }
             Panel {
@@ -86,13 +86,13 @@ Item {
                 implicitHeight: joinInfo.implicitHeight + 40
                 ColumnLayout {
                     id: joinInfo; anchors.fill: parent; anchors.margins: 20; spacing: 12
-                    Text { text: "Pairing with " + (bridge.view.pairingCafe || "cafe"); color: "#f5fbff"; font.pixelSize: 20 }
-                    Text { text: bridge.view.pairingCode || "Waiting for code"; color: "#35c7c7"; font.pixelSize: 30; font.bold: true }
+                    Text { text: "Pairing with " + (bridge.view.pairingCafe || "cafe"); color: "#F4F7FB"; font.pixelSize: 20 }
+                    Text { text: bridge.view.pairingCode || "Waiting for code"; color: "#64BCC1"; font.pixelSize: 30; font.bold: true }
                     Text { text: bridge.view.pairingState || ""; color: "#a9bfd0"; wrapMode: Text.WordWrap; Layout.fillWidth: true }
                     RowLayout { ActionButton { text: "New code"; onClicked: bridge.renewJoin() } ActionButton { text: "Cancel"; secondary: true; onClicked: bridge.cancelJoin() } }
                 }
             }
-            Text { text: "Developed by Sumit Kumar · StickForYou"; color: "#7892a4"; font.pixelSize: 11; Layout.alignment: Qt.AlignHCenter }
+            Text { text: "Developed by Sumit Kumar · StickForYou"; color: "#8398AC"; font.pixelSize: 11; Layout.alignment: Qt.AlignHCenter }
         }
     }
 }

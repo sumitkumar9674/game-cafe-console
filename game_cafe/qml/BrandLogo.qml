@@ -7,20 +7,26 @@ Item {
 
     Image {
         id: logo
+        objectName: "gamegridLogoImage"
         anchors.fill: parent
         source: bridge.view.appLogoSource || ""
         fillMode: Image.PreserveAspectFit
         asynchronous: true
-        sourceSize.width: 380
-        sourceSize.height: 172
+        sourceSize.width: 256
+        sourceSize.height: 256
         visible: source.toString() !== "" && status === Image.Ready
     }
     Text {
         anchors.centerIn: parent
-        text: "StickForYou"
-        color: "#f5fbff"
-        font.pixelSize: 28
+        width: parent.width
+        height: parent.height
+        text: "GameGrid"
+        color: "#F4F7FB"
+        font.pixelSize: Math.min(28, root.height * 0.3)
+        fontSizeMode: Text.Fit
         font.bold: true
+        horizontalAlignment: Text.AlignHCenter
+        verticalAlignment: Text.AlignVCenter
         visible: !logo.visible
     }
 }

@@ -9,21 +9,21 @@ ComboBox {
     rightPadding: 28
     contentItem: Text {
         text: control.displayText
-        color: "#f4f8fa"
+        color: "#F4F7FB"
         verticalAlignment: Text.AlignVCenter
         elide: Text.ElideRight
     }
     indicator: Text {
         text: "▾"
-        color: "#35c7c7"
+        color: "#64BCC1"
         anchors.right: parent.right
         anchors.rightMargin: 10
         anchors.verticalCenter: parent.verticalCenter
     }
     background: Rectangle {
         radius: 6
-        color: "#26384b"
-        border.color: control.activeFocus || control.popup.visible ? "#35c7c7" : "#415368"
+        color: !control.enabled ? "#273449" : control.hovered ? "#2C455D" : "#203348"
+        border.color: control.activeFocus || control.popup.visible ? "#D85288" : "#455C73"
     }
     delegate: ItemDelegate {
         id: delegateItem
@@ -34,11 +34,11 @@ ComboBox {
         text: modelData && modelData.name !== undefined ? modelData.name : String(modelData)
         highlighted: control.highlightedIndex === index
         background: Rectangle {
-            color: delegateItem.highlighted ? "#315a68" : delegateItem.hovered ? "#30475c" : "#1b2b3c"
+            color: delegateItem.highlighted ? "#34546D" : delegateItem.hovered ? "#2C455D" : "#1B2B40"
         }
         contentItem: Text {
             text: delegateItem.text
-            color: "#f4f8fa"
+            color: "#F4F7FB"
             verticalAlignment: Text.AlignVCenter
             leftPadding: 9
         }
@@ -60,8 +60,8 @@ ComboBox {
         }
         background: Rectangle {
             objectName: control.objectName + "PopupBackground"
-            color: "#1b2b3c"
-            border.color: "#35c7c7"
+            color: "#1B2B40"
+            border.color: "#D85288"
             radius: 6
         }
     }

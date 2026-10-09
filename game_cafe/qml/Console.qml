@@ -4,6 +4,8 @@ import QtQuick.Layouts
 
 Item {
     id: page
+    Theme { id: theme }
+    readonly property int brandSize: Math.min(120, Math.max(88, height * 0.09))
     property string staffPanel: ""
     function validMinutes(value, allowZero) {
         let text = String(value).trim()
@@ -31,16 +33,17 @@ Item {
             else root.cancelConfirmation()
         }
     }
-    Rectangle { anchors.fill: parent; color: "#101c2b" }
+    Rectangle { anchors.fill: parent; color: "#0B1120" }
     ColumnLayout {
         anchors.fill: parent; anchors.margins: 36; spacing: 15
-        RowLayout { Layout.fillWidth: true
-            Avatar { diameter: 48 }
+        RowLayout { Layout.fillWidth: true; spacing: 14
+            BrandLogo { Layout.preferredWidth: page.brandSize; Layout.preferredHeight: page.brandSize }
+            Avatar { diameter: Math.round(page.brandSize * 0.7) }
             ColumnLayout { Layout.fillWidth: true
-                Text { text: bridge.view.cafeName || "Game Cafe Console"; color: "#f5fbfd"; font.pixelSize: 18; font.bold: true }
-                Text { text: bridge.view.ownName || "User PC"; color: "#91a7ba" }
+                Text { text: bridge.view.cafeName || "GameGrid"; color: "#F4F7FB"; font.pixelSize: 18; font.bold: true }
+                Text { text: bridge.view.ownName || "User PC"; color: "#A8B8CA" }
             }
-            Text { text: bridge.view.connectionNote || "LOCAL CAFE"; color: "#8fb0bf"; font.pixelSize: 12 }
+            Text { text: bridge.view.connectionNote || "LOCAL CAFE"; color: "#A8B8CA"; font.pixelSize: 12 }
         }
         Item { Layout.fillHeight: true }
         Panel {
@@ -49,11 +52,11 @@ Item {
             implicitHeight: consoleBody.implicitHeight + 54
             ColumnLayout {
                 id: consoleBody; anchors.fill: parent; anchors.margins: 27; spacing: 18
-                Text { text: bridge.view.accessAllowed ? "YOUR SESSION IS ACTIVE" : "THIS PC IS LOCKED"; color: bridge.view.accessAllowed ? "#51d9bc" : "#f0b66c"; font.bold: true; font.pixelSize: 13 }
-                Text { text: bridge.view.player || "Guest"; color: "#f7fbfd"; font.pixelSize: 29; font.bold: true }
-                Text { text: bridge.view.phase || "WAITING"; color: "#96aec0"; font.pixelSize: 14 }
-                Text { text: bridge.view.timeText || "00:00:00"; color: "#35c7c7"; font.pixelSize: 53; font.bold: true; visible: bridge.view.hasSession }
-                Text { text: bridge.view.feedback || "Ask staff to start or renew your session."; color: "#a8c0ce"; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                Text { text: bridge.view.accessAllowed ? "YOUR SESSION IS ACTIVE" : "THIS PC IS LOCKED"; color: bridge.view.accessAllowed ? "#A4B36A" : "#F2A65A"; font.bold: true; font.pixelSize: 13 }
+                Text { text: bridge.view.player || "Guest"; color: "#F4F7FB"; font.pixelSize: 29; font.bold: true }
+                Text { text: bridge.view.phase || "WAITING"; color: "#A8B8CA"; font.pixelSize: 14 }
+                Text { objectName: "consoleSessionTimer"; text: bridge.view.timeText || "00:00:00"; color: bridge.view.phase === "BUFFER" ? theme.buffer : bridge.view.phase === "PAUSED" ? theme.paused : bridge.view.phase === "GRACE" || bridge.view.phase === "EXPIRED" ? theme.grace : theme.active; font.pixelSize: 53; font.bold: true; visible: bridge.view.hasSession }
+                Text { text: bridge.view.feedback || "Ask staff to start or renew your session."; color: "#A8B8CA"; wrapMode: Text.WordWrap; Layout.fillWidth: true }
                 RowLayout { Layout.fillWidth: true; spacing: 10
                     ActionButton { text: "Open desktop"; visible: bridge.view.accessAllowed; onClicked: bridge.goDesktop() }
                     ActionButton { text: bridge.view.requestCooldown > 0 ? "Wait " + bridge.view.requestCooldown + "s" : (bridge.view.feedback || "").startsWith("Request failed") ? "Retry request" : "Request unlock"; visible: !bridge.view.accessAllowed; enabled: bridge.view.requestCooldown <= 0 && !bridge.busy; onClicked: bridge.requestUnlock() }
@@ -71,7 +74,7 @@ Item {
         }
         Panel { Layout.alignment: Qt.AlignHCenter; Layout.preferredWidth: Math.min(page.width - 72, 650); implicitHeight: staffBody.implicitHeight + 36; visible: page.staffPanel === "staff"
             ColumnLayout { id: staffBody; anchors.fill: parent; anchors.margins: 18; spacing: 12
-                Text { text: bridge.staffAuthorized ? "Staff Controls" : "Staff Access · Admin password required"; color: "#f3f9fb"; font.bold: true }
+                Text { text: bridge.staffAuthorized ? "Staff Controls" : "Staff Access · Admin password required"; color: "#F4F7FB"; font.bold: true }
                 ColumnLayout {
                     visible: !bridge.staffAuthorized
                     Layout.fillWidth: true
@@ -89,7 +92,7 @@ Item {
                     visible: bridge.staffAuthorized
                     Layout.fillWidth: true
                     spacing: 10
-                    Text { text: (bridge.view.phase || "WAITING") + " · " + (bridge.view.timeText || "00:00:00"); color: "#35c7c7"; font.bold: true }
+                    Text { objectName: "staffSessionTimer"; text: (bridge.view.phase || "WAITING") + " · " + (bridge.view.timeText || "00:00:00"); color: bridge.view.phase === "BUFFER" ? theme.buffer : bridge.view.phase === "PAUSED" ? theme.paused : bridge.view.phase === "GRACE" || bridge.view.phase === "EXPIRED" ? theme.grace : theme.active; font.bold: true }
                     RowLayout {
                         visible: !bridge.view.hasSession
                         Layout.fillWidth: true
@@ -137,15 +140,15 @@ Item {
                             }
                         }
                     }
-                    Rectangle { Layout.fillWidth: true; implicitHeight: 1; color: "#395064" }
+                    Rectangle { Layout.fillWidth: true; implicitHeight: 1; color: "#455C73" }
                     ActionButton { text: "Switch to Admin"; Layout.fillWidth: true; enabled: bridge.view.canSwitchAdmin && !bridge.view.hasSession && !bridge.busy; onClicked: bridge.switchAdmin() }
                     ActionButton { objectName: "staffCloseSoftware"; text: "Close Software"; Layout.fillWidth: true; danger: true; enabled: !bridge.busy; onClicked: {
                         if (bridge.hasLocalSession()) {
                             root.ask("Active Session Detected",
-                                     "An active gaming session is running on this computer. Closing Game Cafe Console will end this session and save its history. Do you want to continue?",
+                                     "An active gaming session is running on this computer. Closing GameGrid will end this session and save its history. Do you want to continue?",
                                      "End Session & Exit", function(){ bridge.closeSoftware() })
                         } else {
-                            root.ask("Close software", "Close Game Cafe Console on this PC and restore the normal Windows desktop?",
+                            root.ask("Close software", "Close GameGrid on this PC and restore the normal Windows desktop?",
                                      "Close", function(){ bridge.closeSoftware() })
                         }
                     } }
@@ -153,6 +156,6 @@ Item {
                 }
             }
         }
-        Text { text: "Developed by Sumit Kumar · StickForYou"; color: "#7892a4"; font.pixelSize: 11; Layout.alignment: Qt.AlignHCenter }
+        Text { text: "Developed by Sumit Kumar · StickForYou"; color: "#8398AC"; font.pixelSize: 11; Layout.alignment: Qt.AlignHCenter }
     }
 }

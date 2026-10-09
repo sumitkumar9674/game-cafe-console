@@ -11,8 +11,8 @@ Item {
     Rectangle {
         anchors.fill: parent
         radius: 14
-        color: "#132235"
-        border.color: "#3c5264"
+        color: "#111B2B"
+        border.color: "#455C73"
         clip: true
         Image {
             id: preview
@@ -31,7 +31,7 @@ Item {
             horizontalAlignment: Text.AlignHCenter
             wrapMode: Text.WordWrap
             text: root.source.toString() === "" ? "No valid image selected" : "Image unavailable"
-            color: "#91a9ba"
+            color: "#A8B8CA"
             visible: !preview.visible
         }
     }

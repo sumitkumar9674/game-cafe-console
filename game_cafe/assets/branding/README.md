@@ -1,11 +1,9 @@
-# Optional application branding
+# GameGrid application branding
 
-Place these files here when branded artwork is available:
+- `app_logo.png` is the approved, unmodified full GameGrid artwork.
+- `app_icon.ico` contains the full artwork at standard Windows icon sizes for
+  the executable, title bar, and taskbar. The existing build script picks it up.
 
-- `app_icon.ico` — Windows executable, title-bar, and taskbar icon.
-- `app_logo.png` — logo shown on the startup and Admin-login loading screen.
-
-Both files are optional. Missing or unreadable files use the built-in Qt icon and
-the existing **StickForYou** text fallback, and do not prevent running or building
-the application. Keep the existing developer attribution and About content when
-replacing either asset.
+If either asset is missing, the application still runs: Qt uses its default icon
+or the **GameGrid** text fallback. Keep the developer attribution and About
+content when replacing either asset.

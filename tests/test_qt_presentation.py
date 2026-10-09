@@ -13,12 +13,12 @@ import unittest
 from unittest.mock import Mock, patch
 
 from PySide6.QtCore import QByteArray, QBuffer, QIODevice, QObject, QUrl
-from PySide6.QtGui import QImage
+from PySide6.QtGui import QIcon, QImage
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtWidgets import QApplication
 
 from game_cafe import sessions
-from game_cafe.branding import app_logo_source, valid_image
+from game_cafe.branding import APP_ICON_PATH, APP_LOGO_PATH, app_logo_source, valid_image
 from game_cafe.qt_bridge import CafeBridge, RecordListModel
 from game_cafe.qt_app import AvatarProvider
 from game_cafe.storage import Store, new_pool
@@ -179,6 +179,134 @@ class QtPresentationTest(unittest.TestCase):
         password.setProperty("passwordVisible", False)
         self.app.processEvents()
         self.assertNotEqual(password.property("displayText"), "temporary test password")
+
+    def test_gamegrid_artwork_loads_in_existing_logo_container(self):
+        self.assertTrue(valid_image(APP_LOGO_PATH))
+        icon = QIcon(str(APP_ICON_PATH))
+        self.assertFalse(icon.isNull())
+        self.assertIn(16, [size.width() for size in icon.availableSizes()])
+        self.assertIn(256, [size.width() for size in icon.availableSizes()])
+        engine = QQmlApplicationEngine()
+        engine.rootContext().setContextProperty("bridge", self.bridge)
+        qml = Path(__file__).resolve().parents[1] / "game_cafe" / "qml" / "App.qml"
+        engine.load(QUrl.fromLocalFile(str(qml)))
+        root = engine.rootObjects()[0]
+        logo = root.findChild(QObject, "gamegridLogoImage")
+        self.assertIsNotNone(logo)
+        self.assertEqual(logo.property("source").toString(), app_logo_source())
+        deadline = time.monotonic() + 2
+        while not logo.property("visible") and time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(0.01)
+        self.assertTrue(logo.property("visible"))
+        self.assertEqual(root.property("title"), "GameGrid")
+
+    def test_gamegrid_branding_fits_splash_and_about_at_desktop_sizes(self):
+        engine = QQmlApplicationEngine()
+        engine.rootContext().setContextProperty("bridge", self.bridge)
+        qml = Path(__file__).resolve().parents[1] / "game_cafe" / "qml" / "App.qml"
+        engine.load(QUrl.fromLocalFile(str(qml)))
+        root = engine.rootObjects()[0]
+        for width, height, minimum in ((1920, 1080, 300), (2560, 1440, 400)):
+            root.setWidth(width)
+            root.setHeight(height)
+            self.app.processEvents()
+            logo = root.findChild(QObject, "gamegridLogoImage")
+            self.assertGreaterEqual(logo.width(), minimum)
+            self.assertLessEqual(logo.width(), 420)
+            self.assertEqual(logo.width(), logo.height())
+        self.bridge._set_mode("admin")
+        self.app.processEvents()
+        admin = root.findChild(QObject, "adminPage")
+        admin.setProperty("section", "About")
+        self.app.processEvents()
+        logos = admin.findChildren(QObject, "gamegridLogoImage")
+        self.assertEqual([round(logo.width()) for logo in logos], [180])
+
+    def test_admin_sidebar_uses_cafe_avatar_and_name(self):
+        self.bridge._set_view(cafeName="Sumit Cafe", hasAvatar=False,
+                              avatarSource="")
+        self.bridge._set_mode("admin")
+        engine = QQmlApplicationEngine()
+        engine.addImageProvider("cafe", AvatarProvider(self.store))
+        engine.rootContext().setContextProperty("bridge", self.bridge)
+        qml = Path(__file__).resolve().parents[1] / "game_cafe" / "qml" / "App.qml"
+        engine.load(QUrl.fromLocalFile(str(qml)))
+        root = engine.rootObjects()[0]
+        admin = root.findChild(QObject, "adminPage")
+        avatar = admin.findChild(QObject, "adminCafeAvatar")
+        name = admin.findChild(QObject, "adminCafeName")
+        self.assertEqual(avatar.property("diameter"), 78)
+        self.assertEqual(name.property("text"), "Sumit Cafe")
+        self.assertEqual(admin.findChildren(QObject, "gamegridLogoImage"), [])
+        image = next(child for child in avatar.findChildren(QObject)
+                     if child.property("source") is not None)
+        initials = next(child for child in avatar.findChildren(QObject)
+                        if child.property("text") == "SU")
+        self.assertIsNotNone(initials)
+        self.assertFalse(image.property("visible"))
+
+        snapshot, secret = new_pool("Sumit Cafe", self.store.pc_id, "PC-01",
+                                    "Admin", "long test password",
+                                    self.store.node_public_key())
+        previous_source = ""
+        for color in ("#D85288", "#64BCC1"):
+            picture = QImage(8, 8, QImage.Format_ARGB32)
+            picture.fill(color)
+            payload = QByteArray()
+            buffer = QBuffer(payload)
+            buffer.open(QIODevice.WriteOnly)
+            self.assertTrue(picture.save(buffer, "PNG"))
+            buffer.close()
+            snapshot["logo"] = base64.b64encode(bytes(payload)).decode("ascii")
+            self.store.save_pool(snapshot, secret, join=True)
+            source = self.bridge._branding(self.store.snapshot())["avatarSource"]
+            self.assertTrue(source.startswith("image://cafe/avatar/"))
+            self.assertNotEqual(source, previous_source)
+            self.bridge._set_view(hasAvatar=True, avatarSource=source)
+            deadline = time.monotonic() + 2
+            while (not image.property("visible") or
+                   image.property("source").toString() != source) and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(0.01)
+            self.assertEqual(image.property("source").toString(), source)
+            self.assertTrue(image.property("visible"))
+            self.assertEqual(name.property("text"), "Sumit Cafe")
+            snapshot["revision"] += 1
+            previous_source = source
+        self.bridge._set_view(cafeName="New Cafe", hasAvatar=False,
+                              avatarSource="")
+        self.app.processEvents()
+        self.assertEqual(name.property("text"), "New Cafe")
+        self.assertEqual(initials.property("text"), "NE")
+        self.assertFalse(image.property("visible"))
+
+    def test_gamegrid_timers_follow_existing_phase_in_every_surface(self):
+        self.bridge._set_view(hasSession=True, phase="BUFFER", timeText="00:04:59")
+        engine = QQmlApplicationEngine()
+        engine.rootContext().setContextProperty("bridge", self.bridge)
+        qml = Path(__file__).resolve().parents[1] / "game_cafe" / "qml" / "App.qml"
+        engine.load(QUrl.fromLocalFile(str(qml)))
+        root = engine.rootObjects()[0]
+        colors = {
+            "BUFFER": "#FACC15", "TIMED": "#64BCC1",
+            "OPEN": "#64BCC1", "PAUSED": "#B9A4D7", "GRACE": "#F2A65A",
+        }
+        # ListView creates Admin card delegates only when exposed on screen.
+        admin_qml = qml.with_name("Admin.qml").read_text(encoding="utf-8")
+        self.assertIn('objectName: "adminSessionTimer"', admin_qml)
+        self.assertIn('card.rowData.phase === "BUFFER" ? theme.buffer', admin_qml)
+        for mode, name in (("console", "consoleSessionTimer"),
+                           ("widget", "widgetSessionTimer")):
+            self.bridge._set_mode(mode)
+            self.app.processEvents()
+            timer = root.findChild(QObject, name)
+            self.assertIsNotNone(timer, mode)
+            for phase, expected in colors.items():
+                with self.subTest(mode=mode, phase=phase):
+                    self.bridge._set_view(phase=phase)
+                    self.app.processEvents()
+                    self.assertEqual(timer.property("color").name().upper(), expected)
 
     def test_settings_history_clear_requires_two_confirmations(self):
         owner = self.store.pc_id

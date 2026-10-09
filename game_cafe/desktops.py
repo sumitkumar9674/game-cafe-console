@@ -89,8 +89,6 @@ kernel32.WaitForMultipleObjects.restype = wintypes.DWORD
 kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE,
                                         ctypes.POINTER(wintypes.DWORD)]
 kernel32.GetExitCodeProcess.restype = wintypes.BOOL
-kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
-kernel32.TerminateProcess.restype = wintypes.BOOL
 kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 kernel32.CloseHandle.restype = wintypes.BOOL
 kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
@@ -243,14 +241,12 @@ def stop_child(process: int | None, stop_event: int | None) -> None:
         return
     if stop_event:
         signal(stop_event)
-    result = kernel32.WaitForSingleObject(process, 3000)
+    result = kernel32.WaitForSingleObject(process, 8000)
     if result == WAIT_OBJECT_0:
         return
     if result != WAIT_TIMEOUT:
         raise error("WaitForSingleObject")
-    if not kernel32.TerminateProcess(process, 1):
-        raise error("TerminateProcess")
-    kernel32.WaitForSingleObject(process, 3000)
+    raise TimeoutError("CafeConsole child did not stop; shutdown can be retried.")
 
 
 def open_parent_process(pid: int) -> int:

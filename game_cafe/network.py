@@ -339,6 +339,9 @@ class NodeNetwork:
                                   "response", body,
                                   self.store.node_private_key())
                 send_message(connection, response)
+                if operation == "remote_exit" and body["ok"] and result.get("accepted"):
+                    # Exit only after the acknowledgement has been sent.
+                    self.runtime.notify("remote_exit")
             except Exception as error:
                 try:
                     send_message(connection, {"ok": False, "error": str(error)})

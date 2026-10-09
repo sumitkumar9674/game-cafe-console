@@ -124,6 +124,22 @@ class QtPresentationTest(unittest.TestCase):
             "start", "pc-10", kind="timed", paid_minutes=60,
             buffer_minutes=0)
 
+    def test_admin_custom_start_and_add_target_immutable_pc_id(self):
+        self.bridge.pc_model.update_rows([{
+            "pcId": "target-id", "name": "PC-02", "start": True, "add": True,
+        }])
+        with patch.object(self.bridge, "refresh"):
+            self.bridge.startSession("target-id", "timed", "37", "3")
+            self.wait_for_idle()
+            self.runtime.admin_action.assert_called_with(
+                "start", "target-id", kind="timed", paid_minutes=37,
+                buffer_minutes=3)
+            self.runtime.admin_action.reset_mock()
+            self.bridge.addTime("target-id", 23)
+            self.wait_for_idle()
+        self.runtime.admin_action.assert_called_once_with(
+            "add", "target-id", minutes=23)
+
     def test_all_qml_surfaces_load(self):
         self.bridge.pc_model.update_rows([{
             "pcId": "b", "name": "PC-02", "role": "USER", "online": True,
@@ -146,7 +162,7 @@ class QtPresentationTest(unittest.TestCase):
         self.assertIsNotNone(loader)
         # Loading every route catches missing QML imports without creating a real desktop.
         for mode in ("onboarding", "joining", "candidate", "admin", "widget",
-                     "compact", "console"):
+                     "console"):
             self.bridge._set_mode(mode)
             self.app.processEvents()
             self.assertEqual(self.bridge.mode, mode)
@@ -162,6 +178,59 @@ class QtPresentationTest(unittest.TestCase):
         password.setProperty("passwordVisible", False)
         self.app.processEvents()
         self.assertNotEqual(password.property("displayText"), "temporary test password")
+
+    def test_settings_history_clear_requires_two_confirmations(self):
+        owner = self.store.pc_id
+        self.bridge._set_view(historyTargets=[
+            {"pcId": owner, "name": "PC-01", "count": 3, "online": True},
+            {"pcId": "offline", "name": "PC-02", "count": 2, "online": False},
+        ])
+        self.bridge._set_mode("admin")
+        engine = QQmlApplicationEngine()
+        engine.rootContext().setContextProperty("bridge", self.bridge)
+        qml = Path(__file__).resolve().parents[1] / "game_cafe" / "qml" / "App.qml"
+        engine.load(QUrl.fromLocalFile(str(qml)))
+        root = engine.rootObjects()[0]
+        page = root.findChild(QObject, "adminPage")
+        page.setProperty("section", "Settings")
+        self.app.processEvents()
+        selector = root.findChild(QObject, "historyPcSelector")
+        clear = root.findChild(QObject, "clearSelectedHistory")
+        self.assertIsNotNone(selector)
+        self.assertIsNotNone(clear)
+        popup = root.findChild(QObject, "historyPcSelectorPopup")
+        popup.metaObject().invokeMethod(popup, "open")
+        self.app.processEvents()
+        self.assertEqual(selector.property("count"), 2)
+        self.assertEqual(root.findChild(QObject, "historyPcSelectorPopupList")
+                         .property("count"), 2)
+        popup.metaObject().invokeMethod(popup, "close")
+        page.setProperty("historyTargetId", "offline")
+        self.app.processEvents()
+        self.assertFalse(clear.property("enabled"))
+        page.setProperty("historyTargetId", owner)
+        self.app.processEvents()
+        self.assertTrue(clear.property("enabled"))
+        with patch.object(self.bridge, "clearHistory") as submit:
+            clear.clicked.emit()
+            self.app.processEvents()
+            submit.assert_not_called()
+            root.metaObject().invokeMethod(root, "cancelConfirmation")
+            self.app.processEvents()
+            submit.assert_not_called()
+            clear.clicked.emit()
+            page.setProperty("historyTargetId", "offline")
+            root.metaObject().invokeMethod(root, "acceptConfirmation")
+            self.app.processEvents()
+            submit.assert_not_called()
+            page.setProperty("historyTargetId", owner)
+            clear.clicked.emit()
+            root.metaObject().invokeMethod(root, "acceptConfirmation")
+            self.app.processEvents()
+            submit.assert_not_called()
+            root.metaObject().invokeMethod(root, "acceptConfirmation")
+            self.app.processEvents()
+            submit.assert_called_once_with(owner)
 
     def test_admin_password_is_hidden_and_can_be_revealed(self):
         self.bridge._set_mode("candidate")

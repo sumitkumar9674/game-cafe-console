@@ -63,8 +63,13 @@ class DashboardControlsTest(unittest.TestCase):
 
     def test_validation_and_add_time_preview(self):
         self.assertEqual(validate_start("timed", "60", "5"), (60, 5))
+        self.assertEqual(validate_start("timed", "37", "0"), (37, 0))
+        self.assertEqual(validate_start("open", "0", "5"), (0, 5))
         with self.assertRaises(ValueError):
             validate_start("timed", "0", "5")
+        for invalid in ("", "-1", "1.5", "1e2", "1441"):
+            with self.assertRaises(ValueError):
+                validate_start("timed", invalid, "0")
         self.snap["sessions"][USER] = sessions.start_session(
             "timed", 30, 0, now=self.now)
         self.assertIn("45 minutes", add_time_preview(self.snap, USER, 15,

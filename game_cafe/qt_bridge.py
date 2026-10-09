@@ -263,6 +263,12 @@ class CafeBridge(QObject):
             self.refresh()
         self._submit(name, work, done, blocking=True)
 
+    def begin_shutdown(self, work: Callable, done: Callable) -> bool:
+        if self._shutting_down or self._busy:
+            return False
+        self._submit("shutdown", work, done, blocking=True)
+        return True
+
     @staticmethod
     def _branding(snapshot: dict | None) -> dict:
         if not snapshot:
@@ -529,6 +535,11 @@ class CafeBridge(QObject):
                          (self.runtime.peer_status(pc_id) is not None if self.runtime else False),
                          "ip": peers.get(pc_id, {}).get("ip", "")}
                         for pc_id, member in snap["members"].items()],
+            "historyTargets": [{"pcId": pc_id, "name": member["name"],
+                                "count": len(snap["history"].get(pc_id, [])),
+                                "online": pc_id == own or
+                                (self.runtime.peer_status(pc_id) is not None if self.runtime else False)}
+                               for pc_id, member in snap["members"].items()],
             "cafeName": snap["cafe_name"],
             "ownName": snap["members"].get(own, {}).get("name", "PC"),
             "session": session, "phase": phase.upper(),
@@ -597,7 +608,7 @@ class CafeBridge(QObject):
                 result["requestCooldown"] = max(0, int(self._cooldown_until - time.time()))
             result.pop("session")
             self._set_view(**result)
-            if self._mode in ("widget", "compact"):
+            if self._mode == "widget":
                 self.host.update_widget_access(bool(result["accessAllowed"]))
         self._submit("refresh", lambda: self._collect_state(selected, all_history), done)
 
@@ -721,6 +732,17 @@ class CafeBridge(QObject):
     def renamePc(self, pc_id: str, name: str) -> None:
         self._action("rename_pc", lambda: self.runtime.admin_action(
             "rename_pc", pc_id, name=name))
+
+    @Slot(str)
+    def clearHistory(self, pc_id: str) -> None:
+        target = next((item for item in self._view.get("historyTargets", [])
+                       if item["pcId"] == pc_id), None)
+        if not target or not target["online"] or not target["count"]:
+            self._show_notice("Cannot clear history",
+                              "Select an online PC with completed sessions.", True)
+            return
+        self._action("clear_history", lambda: self.runtime.clear_history(pc_id),
+                     f"Completed history cleared for {target['name']}.")
 
     @Slot(str, str, str, str)
     def saveSettings(self, cafe_name: str, admin_name: str,
@@ -1010,6 +1032,11 @@ class CafeBridge(QObject):
                 self._post_child("close_software", {"password_sealed": credential})
                 self._revoke_staff()
 
+    @Slot(result=bool)
+    def hasLocalSession(self) -> bool:
+        snap = self.store.snapshot()
+        return bool(snap and snap["sessions"].get(self.store.pc_id))
+
     @Slot()
     def goDesktop(self) -> None:
         if not self.child or not self._view.get("accessAllowed"):
@@ -1030,20 +1057,10 @@ class CafeBridge(QObject):
         if not self.child:
             self.host.hide_widget()
 
-    @Slot()
-    def compactTimer(self) -> None:
+    @Slot(int)
+    def updateWidgetHeight(self, required: int) -> None:
         if not self.child:
-            self.host.show_compact_timer()
-
-    @Slot()
-    def expandWidget(self) -> None:
-        if not self.child:
-            self.host.expand_widget()
-
-    @Slot()
-    def clampCompactTimer(self) -> None:
-        if not self.child:
-            self.host.clamp_compact_timer()
+            self.host.update_widget_height(required)
 
     @Slot()
     def closeAdmin(self) -> None:
@@ -1067,14 +1084,19 @@ class CafeBridge(QObject):
             self.host.check_child_liveness()
             return
         try:
-            if (not self.host.console_transitioning and self.host.console_process
+            if (self.host.shutdown_state == "idle" and
+                    not self.host.console_transitioning and self.host.console_process
                     and desktops.exited(self.host.console_process)):
                 self._show_notice("User Console stopped",
                                   "CafeConsole exited. Default will be restored.", True)
-                self.host.shutdown()
+                # Keep the checkpoint for interrupted-session recovery on restart.
+                self.host.shutdown(finalize_local_session=False)
                 return
-            for action, payload in self.store.take_local_commands():
-                self._handle_local_command(action, payload)
+            while not self._busy and self.host.shutdown_state in ("idle", "failed"):
+                commands = self.store.take_local_commands(limit=1)
+                if not commands:
+                    break
+                self._handle_local_command(*commands[0])
             while True:
                 try:
                     kind, value = self.runtime.events.get_nowait()
@@ -1130,7 +1152,6 @@ class CafeBridge(QObject):
                 snap = self.runtime.snapshot()
                 if not verify_password(password, snap["admin_password"]):
                     raise PermissionError("Incorrect Admin password.")
-                self.runtime.finish_local_session("close_software")
             def done(result, error):
                 if error:
                     self.store.set_local("customer_feedback", f"Close failed: {error}")

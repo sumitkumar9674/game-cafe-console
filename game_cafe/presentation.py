@@ -112,12 +112,15 @@ def history_rows(snapshot: dict, pc_id: str | None) -> list[dict]:
         "counted": duration(record["counted_seconds"]),
         "paidMinutes": record["paid_minutes"],
         "reason": record["reason"].replace("_", " ").title(),
-    } for record in sorted(records, key=lambda item: item["ended_at"], reverse=True)[:40]]
+    } for record in sorted(records, key=lambda item: item["ended_at"], reverse=True)]
 
 
 def validate_start(kind: str, paid: str, buffer: str) -> tuple[int, int]:
     if kind not in ("timed", "open"):
         raise ValueError("Choose a timed or no-timer session.")
+    if (kind == "timed" and not re.fullmatch(r"[0-9]+", paid.strip())) or \
+            not re.fullmatch(r"[0-9]+", buffer.strip()):
+        raise ValueError("Enter whole minutes only.")
     try:
         paid_minutes = int(paid.strip()) if kind == "timed" else 0
         buffer_minutes = int(buffer.strip())
@@ -131,7 +134,7 @@ def validate_start(kind: str, paid: str, buffer: str) -> tuple[int, int]:
 
 
 def validate_add(minutes: int) -> int:
-    if not 1 <= minutes <= 1440:
+    if isinstance(minutes, bool) or not isinstance(minutes, int) or not 1 <= minutes <= 1440:
         raise ValueError("Added time must be 1 to 1440 minutes.")
     return minutes
 

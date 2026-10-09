@@ -5,6 +5,12 @@ import QtQuick.Layouts
 Item {
     id: page
     property string staffPanel: ""
+    function validMinutes(value, allowZero) {
+        let text = String(value).trim()
+        if (!/^[0-9]+$/.test(text)) return false
+        let minutes = Number(text)
+        return Number.isInteger(minutes) && minutes <= 1440 && minutes >= (allowZero ? 0 : 1)
+    }
     function toggleStaffAccess() {
         if (staffPanel === "staff") {
             staffPassword.text = ""
@@ -87,8 +93,8 @@ Item {
                     RowLayout {
                         visible: !bridge.view.hasSession
                         Layout.fillWidth: true
-                        ComboBox { id: staffKind; model: ["Timed", "No timer"]; Layout.preferredWidth: 115; onActivated: bridge.touchStaffAccess() }
-                        ComboBox { id: staffPaid; model: ["15", "30", "60", "120", "Custom Minutes"]; currentIndex: 2; visible: staffKind.currentIndex === 0; Layout.preferredWidth: 145; onActivated: bridge.touchStaffAccess() }
+                        DarkComboBox { id: staffKind; objectName: "staffSessionKind"; model: ["Timed", "No timer"]; Layout.preferredWidth: 115; onActivated: bridge.touchStaffAccess() }
+                        DarkComboBox { id: staffPaid; objectName: "staffSessionDuration"; model: ["15", "30", "60", "120", "Custom Minutes"]; currentIndex: 2; visible: staffKind.currentIndex === 0; Layout.preferredWidth: 145; onActivated: bridge.touchStaffAccess() }
                         TextField { id: staffCustomPaid; visible: staffKind.currentIndex === 0 && staffPaid.currentIndex === 4; placeholderText: "Minutes"; Layout.preferredWidth: 86; inputMethodHints: Qt.ImhDigitsOnly; onTextEdited: bridge.touchStaffAccess() }
                         TextField { id: staffBuffer; text: "0"; placeholderText: "Buffer"; Layout.preferredWidth: 82; inputMethodHints: Qt.ImhDigitsOnly; onTextEdited: bridge.touchStaffAccess() }
                     }
@@ -102,13 +108,17 @@ Item {
                             bridge.touchStaffAccess()
                             let kind = staffKind.currentIndex === 0 ? "timed" : "open"
                             let paid = kind === "timed" ? (staffPaid.currentIndex === 4 ? staffCustomPaid.text : staffPaid.currentText) : "0"
+                            if ((kind === "timed" && !page.validMinutes(paid, false)) || !page.validMinutes(staffBuffer.text, true)) {
+                                root.ask("Invalid session time", "Use whole minutes: paid time 1 to 1440 and buffer 0 to 1440.", "OK", function(){})
+                                return
+                            }
                             root.ask("Start local session", "Start this " + (kind === "timed" ? paid + " minute timed" : "no-timer") + " session with " + staffBuffer.text + " buffer minutes?", "Start Session", function(){ bridge.staffStartSession(kind, paid, staffBuffer.text) })
                         }
                     }
                     RowLayout {
                         visible: bridge.view.hasSession && bridge.view.kind === "timed"
                         Layout.fillWidth: true
-                        ComboBox { id: staffAdd; model: ["1", "2", "5", "15", "30", "60", "Custom Minutes"]; currentIndex: 3; Layout.fillWidth: true; onActivated: bridge.touchStaffAccess() }
+                        DarkComboBox { id: staffAdd; objectName: "staffAddDuration"; model: ["1", "2", "5", "15", "30", "60", "Custom Minutes"]; currentIndex: 3; Layout.fillWidth: true; onActivated: bridge.touchStaffAccess() }
                         TextField { id: staffCustomAdd; visible: staffAdd.currentIndex === 6; placeholderText: "Minutes"; Layout.preferredWidth: 86; inputMethodHints: Qt.ImhDigitsOnly; onTextEdited: bridge.touchStaffAccess() }
                         ActionButton {
                             objectName: "staffAddButton"
@@ -116,11 +126,12 @@ Item {
                             enabled: !bridge.busy
                             onClicked: {
                                 bridge.touchStaffAccess()
-                                let minutes = Number(staffAdd.currentIndex === 6 ? staffCustomAdd.text : staffAdd.currentText)
-                                if (!Number.isInteger(minutes) || minutes < 1 || minutes > 1440) {
+                                let raw = staffAdd.currentIndex === 6 ? staffCustomAdd.text : staffAdd.currentText
+                                if (!page.validMinutes(raw, false)) {
                                     root.ask("Invalid time", "Use a whole number from 1 to 1440 minutes.", "OK", function(){})
                                     return
                                 }
+                                let minutes = Number(raw)
                                 let preview = bridge.previewStaffAdd(minutes)
                                 root.ask("Confirm added time", preview, "Add Time", function(){ bridge.staffAddTime(minutes) })
                             }
@@ -128,7 +139,16 @@ Item {
                     }
                     Rectangle { Layout.fillWidth: true; implicitHeight: 1; color: "#395064" }
                     ActionButton { text: "Switch to Admin"; Layout.fillWidth: true; enabled: bridge.view.canSwitchAdmin && !bridge.view.hasSession && !bridge.busy; onClicked: bridge.switchAdmin() }
-                    ActionButton { text: "Close Software"; Layout.fillWidth: true; danger: true; enabled: !bridge.busy; onClicked: root.ask("Close software", "Close Game Cafe Console on this PC? An active session will be finalized and the Windows desktop restored.", "Close", function(){bridge.closeSoftware()}) }
+                    ActionButton { objectName: "staffCloseSoftware"; text: "Close Software"; Layout.fillWidth: true; danger: true; enabled: !bridge.busy; onClicked: {
+                        if (bridge.hasLocalSession()) {
+                            root.ask("Active Session Detected",
+                                     "An active gaming session is running on this computer. Closing Game Cafe Console will end this session and save its history. Do you want to continue?",
+                                     "End Session & Exit", function(){ bridge.closeSoftware() })
+                        } else {
+                            root.ask("Close software", "Close Game Cafe Console on this PC and restore the normal Windows desktop?",
+                                     "Close", function(){ bridge.closeSoftware() })
+                        }
+                    } }
                     ActionButton { objectName: "lockStaffControls"; text: "Lock Staff Controls"; secondary: true; Layout.fillWidth: true; onClicked: { staffPassword.text = ""; root.cancelConfirmation(); bridge.lockStaffAccess() } }
                 }
             }

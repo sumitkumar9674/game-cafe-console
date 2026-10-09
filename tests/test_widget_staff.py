@@ -1,4 +1,4 @@
-"""Compact timer and local Staff authorization without desktop switching."""
+"""Normal widget and local Staff authorization without desktop switching."""
 
 import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -10,13 +10,14 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
-from PySide6.QtCore import QObject, QPoint, Qt
+from PySide6.QtCore import QMetaObject, QObject
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import QApplication
 
 from game_cafe.qt_app import Application
 from game_cafe.qt_bridge import CafeBridge
+from game_cafe import sessions
 from game_cafe.runtime import Runtime
 from game_cafe.security import create_local_command_key, open_local_password
 from game_cafe.storage import Store, hash_password, new_pool
@@ -25,7 +26,7 @@ from game_cafe.storage import Store, hash_password, new_pool
 PASSWORD = "long test password"
 
 
-class CompactTimerTest(unittest.TestCase):
+class WidgetLifecycleTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
@@ -56,40 +57,30 @@ class CompactTimerTest(unittest.TestCase):
         self.store_patch.stop()
         self.temp.cleanup()
 
-    def test_widget_compact_restore_reuses_one_window_and_flags(self):
-        window = self.host.window
-        root_count = len(self.host.engine.rootObjects())
-        self.host.show_compact_timer()
-        self.app.processEvents()
-        self.assertEqual(self.host.bridge.mode, "compact")
-        self.assertIs(self.host.window, window)
-        self.assertEqual(len(self.host.engine.rootObjects()), root_count)
-        self.assertTrue(window.flags() & Qt.FramelessWindowHint)
-        self.assertTrue(window.flags() & Qt.WindowStaysOnTopHint)
-        self.assertTrue(window.flags() & Qt.Tool)
-        self.assertTrue(window.flags() & Qt.WindowDoesNotAcceptFocus)
-        window.setPosition(QPoint(40, 35))
-        self.host.expand_widget()
-        self.app.processEvents()
+    def test_hide_reopen_and_refresh_do_not_change_widget_mode(self):
         self.assertEqual(self.host.bridge.mode, "widget")
-        saved = self.host.compact_position
-        self.host.show_compact_timer()
-        self.app.processEvents()
-        self.assertEqual(self.host.window.position(),
-                         self.host._visible_position(saved))
-
-    def test_compact_timer_updates_and_is_removed_when_access_ends(self):
-        self.host.show_compact_timer()
-        self.host.bridge._set_view(phase="PAUSED", timeText="00:12:34")
-        self.app.processEvents()
-        timer = self.host.window.findChild(QObject, "compactTimeText")
-        phase = self.host.window.findChild(QObject, "compactPhaseText")
-        self.assertEqual(timer.property("text"), "00:12:34")
-        self.assertEqual(phase.property("text"), "PAUSED")
+        with patch.object(self.host, "_show_window", wraps=self.host._show_window) as show:
+            self.host.update_widget_access(True)
+            self.host.update_widget_access(True)
+            show.assert_not_called()
+        if self.host.tray.isVisible():
+            self.host.hide_widget()
+            self.assertFalse(self.host.window.isVisible())
+            self.host.update_widget_access(True)
+            self.assertFalse(self.host.window.isVisible())
+            self.host._show_window()
+            self.assertTrue(self.host.window.isVisible())
         self.host.update_widget_access(False)
         self.app.processEvents()
         self.assertEqual(self.host.bridge.mode, "widget")
         self.assertFalse(self.host.window.isVisible())
+
+    def test_widget_has_content_based_height_and_scroll_fallback(self):
+        loader = self.host.window.findChild(QObject, "mainLoader")
+        content = loader.property("item")
+        self.assertGreaterEqual(self.host.window.minimumHeight(),
+                                min(int(content.property("implicitHeight")),
+                                    self.host.app.primaryScreen().availableGeometry().height() - 40))
 
 
 class StaffAccessTest(unittest.TestCase):
@@ -187,6 +178,36 @@ class StaffAccessTest(unittest.TestCase):
         switch.assert_called_once_with(1)
         self.assertFalse(self.bridge.staffAuthorized)
 
+    def test_staff_dropdowns_have_opaque_scrollable_popups(self):
+        engine = QQmlApplicationEngine()
+        engine.rootContext().setContextProperty("bridge", self.bridge)
+        qml = Path(__file__).resolve().parents[1] / "game_cafe" / "qml" / "App.qml"
+        engine.load(QUrl.fromLocalFile(str(qml)))
+        root = engine.rootObjects()[0]
+        console = root.findChild(QObject, "mainLoader").property("item")
+        console.setProperty("staffPanel", "staff")
+        self.authorize()
+        self.app.processEvents()
+        for name, count in (("staffSessionKind", 2),
+                            ("staffSessionDuration", 5),
+                            ("staffAddDuration", 7)):
+            combo = root.findChild(QObject, name)
+            self.assertIsNotNone(combo)
+            self.assertEqual(combo.property("count"), count)
+            background = root.findChild(QObject, name + "PopupBackground")
+            self.assertIsNotNone(background)
+            self.assertEqual(background.property("color").alpha(), 255)
+            popup_list = root.findChild(QObject, name + "PopupList")
+            self.assertIsNotNone(popup_list)
+            self.assertTrue(popup_list.property("clip"))
+            popup = root.findChild(QObject, name + "Popup")
+            self.assertIsNotNone(popup)
+            QMetaObject.invokeMethod(popup, "open")
+            self.app.processEvents()
+            self.assertTrue(popup.property("visible"))
+            self.assertEqual(popup_list.property("count"), count)
+            QMetaObject.invokeMethod(popup, "close")
+
     def test_password_change_invalidates_authorization(self):
         self.authorize()
         self.store.update(lambda state: state.update(
@@ -204,6 +225,58 @@ class StaffAccessTest(unittest.TestCase):
         self.assertEqual(open_local_password(
             self.private, payload["password_sealed"]), PASSWORD)
         self.assertFalse(self.bridge.staffAuthorized)
+
+    def test_active_close_warns_and_cancel_leaves_session_untouched(self):
+        session = sessions.start_session("timed", 30, 0)
+        self.store.update(lambda state: state["sessions"].update(
+            {self.store.pc_id: session}))
+        engine = QQmlApplicationEngine()
+        engine.rootContext().setContextProperty("bridge", self.bridge)
+        qml = Path(__file__).resolve().parents[1] / "game_cafe" / "qml" / "App.qml"
+        engine.load(QUrl.fromLocalFile(str(qml)))
+        root = engine.rootObjects()[0]
+        root.findChild(QObject, "mainLoader").property("item").setProperty(
+            "staffPanel", "staff")
+        self.authorize()
+        self.app.processEvents()
+        close = root.findChild(QObject, "staffCloseSoftware")
+        close.clicked.emit()
+        self.app.processEvents()
+        confirmation = root.property("confirmation")
+        self.assertEqual(confirmation.property("title").toString(),
+                         "Active Session Detected")
+        self.assertEqual(confirmation.property("label").toString(),
+                         "End Session & Exit")
+        self.assertFalse(self.store.take_local_commands())
+        QMetaObject.invokeMethod(root, "cancelConfirmation")
+        self.assertEqual(self.store.snapshot()["sessions"][self.store.pc_id]["id"],
+                         session["id"])
+        self.assertFalse(self.store.take_local_commands())
+        close.clicked.emit()
+        QMetaObject.invokeMethod(root, "acceptConfirmation")
+        commands = self.store.take_local_commands()
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0][0], "close_software")
+        self.assertFalse(self.bridge.staffAuthorized)
+
+    def test_idle_close_keeps_normal_confirmation_and_requires_staff_auth(self):
+        self.bridge.closeSoftware()
+        self.assertFalse(self.store.take_local_commands())
+        engine = QQmlApplicationEngine()
+        engine.rootContext().setContextProperty("bridge", self.bridge)
+        qml = Path(__file__).resolve().parents[1] / "game_cafe" / "qml" / "App.qml"
+        engine.load(QUrl.fromLocalFile(str(qml)))
+        root = engine.rootObjects()[0]
+        root.findChild(QObject, "mainLoader").property("item").setProperty(
+            "staffPanel", "staff")
+        self.authorize()
+        self.app.processEvents()
+        root.findChild(QObject, "staffCloseSoftware").clicked.emit()
+        self.assertEqual(root.property("confirmation").property("title").toString(),
+                         "Close software")
+        self.assertFalse(self.store.take_local_commands())
+        QMetaObject.invokeMethod(root, "acceptConfirmation")
+        self.assertEqual(self.store.take_local_commands()[0][0], "close_software")
 
 
 class LocalStaffSessionTest(unittest.TestCase):
@@ -251,6 +324,20 @@ class LocalStaffSessionTest(unittest.TestCase):
         self.assertTrue(self.admin_store.merge_owner_record(record))
         self.assertEqual(self.admin_store.snapshot()["sessions"]
                          [self.user_store.pc_id]["paid_minutes"], 75)
+
+    def test_custom_local_minutes_use_same_session_and_add_once(self):
+        self.runtime.local_staff_session_action(
+            "start", PASSWORD, "6" * 32, kind="timed",
+            paid_minutes=37, buffer_minutes=3)
+        before = self.user_store.snapshot()["sessions"][self.user_store.pc_id]
+        self.runtime.local_staff_session_action(
+            "add", PASSWORD, "7" * 32, minutes=23)
+        self.runtime.local_staff_session_action(
+            "add", PASSWORD, "7" * 32, minutes=23)
+        after = self.user_store.snapshot()["sessions"][self.user_store.pc_id]
+        self.assertEqual(after["id"], before["id"])
+        self.assertEqual(after["paid_minutes"], 60)
+        self.assertEqual(after["buffer_minutes"], 3)
 
     def test_local_no_timer_and_invalid_operations(self):
         self.runtime.local_staff_session_action(

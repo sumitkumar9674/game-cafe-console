@@ -4,9 +4,24 @@ import QtQuick.Layouts
 
 Item {
     id: page
+    objectName: "adminPage"
     property string section: "Dashboard"
     property string startKind: "timed"
     property string addValue: "15"
+    property string historyTargetId: ""
+    property string historyPendingId: ""
+    function validMinutes(value, allowZero) {
+        let text = String(value).trim()
+        if (!/^[0-9]+$/.test(text)) return false
+        let minutes = Number(text)
+        return Number.isInteger(minutes) && minutes <= 1440 && minutes >= (allowZero ? 0 : 1)
+    }
+    function historyTarget() {
+        let targets = bridge.view.historyTargets || []
+        for (let i = 0; i < targets.length; ++i)
+            if (targets[i].pcId === historyTargetId) return targets[i]
+        return null
+    }
     RowLayout {
         anchors.fill: parent
         spacing: 0
@@ -74,7 +89,7 @@ Item {
                             Layout.fillWidth: true
                             Text { text: "ALL COMPUTERS"; color: "#aac3d0"; font.bold: true; font.pixelSize: 12; Layout.fillWidth: true }
                             Text { text: "SORT BY"; color: "#7892a4"; font.bold: true; font.pixelSize: 10 }
-                            ComboBox {
+                            DarkComboBox {
                                 objectName: "computerSortBox"
                                 model: ["Recent", "Name (A–Z)"]
                                 currentIndex: bridge.view.computerSort === "name" ? 1 : 0
@@ -122,24 +137,33 @@ Item {
                                         RowLayout {
                                             visible: card.rowData.start
                                             Text { text: "Session"; color: "#a9c0cf" }
-                                            ComboBox { id: kindBox; model: ["Timed", "No timer"]; Layout.preferredWidth: 110 }
-                                            ComboBox { id: paidField; model: ["15", "30", "60", "120", "Custom Minutes"]; currentIndex: 2; visible: kindBox.currentIndex === 0; Layout.preferredWidth: 145 }
+                                            DarkComboBox { id: kindBox; model: ["Timed", "No timer"]; Layout.preferredWidth: 110 }
+                                            DarkComboBox { id: paidField; model: ["15", "30", "60", "120", "Custom Minutes"]; currentIndex: 2; visible: kindBox.currentIndex === 0; Layout.preferredWidth: 145 }
                                             TextField { id: customPaid; visible: kindBox.currentIndex === 0 && paidField.currentIndex === 4; placeholderText: "Minutes"; Layout.preferredWidth: 88; inputMethodHints: Qt.ImhDigitsOnly }
                                             TextField { id: bufferField; text: "0"; placeholderText: "Buffer"; Layout.preferredWidth: 82; inputMethodHints: Qt.ImhDigitsOnly }
-                                            ActionButton { text: "Start session"; onClicked: bridge.startSession(card.rowData.pcId, kindBox.currentIndex === 0 ? "timed" : "open", paidField.currentIndex === 4 ? customPaid.text : paidField.currentText, bufferField.text) }
+                                            ActionButton { text: "Start session"; onClicked: {
+                                                let kind = kindBox.currentIndex === 0 ? "timed" : "open"
+                                                let paid = paidField.currentIndex === 4 ? customPaid.text : paidField.currentText
+                                                if ((kind === "timed" && !page.validMinutes(paid, false)) || !page.validMinutes(bufferField.text, true)) {
+                                                    root.ask("Invalid session time", "Use whole minutes: paid time 1 to 1440 and buffer 0 to 1440.", "OK", function(){})
+                                                    return
+                                                }
+                                                bridge.startSession(card.rowData.pcId, kind, paid, bufferField.text)
+                                            } }
                                         }
                                         RowLayout {
                                             visible: card.rowData.add
-                                            ComboBox { id: addBox; model: ["1","2","5","15","30","60","Custom Minutes"]; currentIndex: 3; Layout.preferredWidth: 145 }
+                                            DarkComboBox { id: addBox; model: ["1","2","5","15","30","60","Custom Minutes"]; currentIndex: 3; Layout.preferredWidth: 145 }
                                             TextField { id: customAdd; visible: addBox.currentIndex === 6; placeholderText: "Minutes"; Layout.preferredWidth: 88; inputMethodHints: Qt.ImhDigitsOnly }
                                             ActionButton {
                                                 text: "Add time"
                                                 onClicked: {
-                                                    var minutes = Number(addBox.currentIndex === 6 ? customAdd.text : addBox.currentText)
-                                                    if (!Number.isInteger(minutes) || minutes < 1 || minutes > 1440) {
+                                                    var raw = addBox.currentIndex === 6 ? customAdd.text : addBox.currentText
+                                                    if (!page.validMinutes(raw, false)) {
                                                         root.ask("Invalid time", "Use a whole number from 1 to 1440 minutes.", "OK", function(){})
                                                         return
                                                     }
+                                                    var minutes = Number(raw)
                                                     var pcId = card.rowData.pcId
                                                     var preview = bridge.previewAddTime(pcId, minutes)
                                                     root.ask("Review added time", preview, "Continue", function(){
@@ -293,6 +317,51 @@ Item {
     Component { id: settings
         ScrollView { contentWidth: availableWidth
             ColumnLayout { width: Math.min(parent.width, 700); spacing: 15
+                Panel { Layout.fillWidth: true; implicitHeight: historyManagement.implicitHeight + 34
+                    ColumnLayout { id: historyManagement; anchors.fill: parent; anchors.margins: 17; spacing: 10
+                        Text { text: "History Management"; color: "#f4fbff"; font.pixelSize: 19; font.bold: true }
+                        DarkComboBox {
+                            id: historyPc
+                            objectName: "historyPcSelector"
+                            Layout.fillWidth: true
+                            model: bridge.view.historyTargets || []
+                            textRole: "name"
+                            displayText: page.historyTarget() ? page.historyTarget().name : "Select a computer"
+                            onActivated: {
+                                page.historyTargetId = model[currentIndex].pcId
+                                page.historyPendingId = ""
+                                root.cancelConfirmation()
+                            }
+                        }
+                        Text { text: page.historyTarget() ? (page.historyTarget().count > 0 ? page.historyTarget().name + " · " + page.historyTarget().count + " completed sessions" : "No completed sessions for this PC.") : "Choose one registered computer."; color: "#91a9ba" }
+                        Text { visible: !!page.historyTarget() && !page.historyTarget().online; text: "This PC must reconnect before its history can be cleared."; color: "#f0b66c"; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                        ActionButton {
+                            objectName: "clearSelectedHistory"
+                            text: "Clear History"
+                            danger: true
+                            enabled: !!page.historyTarget() && page.historyTarget().online && page.historyTarget().count > 0 && !bridge.busy
+                            onClicked: {
+                                let target = page.historyTarget()
+                                if (!target) return
+                                let pcId = target.pcId
+                                let pcName = target.name
+                                page.historyPendingId = pcId
+                                root.ask("Clear history for " + pcName,
+                                         "Only this PC's completed session history will be removed. Its active session and other PCs will not be changed.",
+                                         "Continue", function() {
+                                    if (page.historyPendingId !== pcId || page.historyTargetId !== pcId) return
+                                    root.ask("Final history deletion confirmation",
+                                             "Permanently delete all completed session history for " + pcName + "? This cannot be undone.",
+                                             "Confirm Delete", function() {
+                                        if (page.historyPendingId === pcId && page.historyTargetId === pcId)
+                                            bridge.clearHistory(pcId)
+                                        page.historyPendingId = ""
+                                    })
+                                })
+                            }
+                        }
+                    }
+                }
                 Panel { Layout.fillWidth: true; implicitHeight: identity.implicitHeight + 34
                     ColumnLayout { id: identity; anchors.fill: parent; anchors.margins: 17; spacing: 10
                         Text { text: "Cafe identity"; color: "#f4fbff"; font.pixelSize: 19; font.bold: true }
@@ -323,7 +392,7 @@ Item {
                             ColumnLayout {
                                 Text { text: "PNG or JPG · up to 5 MB"; color: "#91a9ba" }
                                 Text { text: "Preview fit"; color: "#91a9ba"; font.pixelSize: 12 }
-                                ComboBox { id: avatarFit; objectName: "avatarPreviewFit"; model: ["Fit", "Fill"] }
+                                DarkComboBox { id: avatarFit; objectName: "avatarPreviewFit"; model: ["Fit", "Fill"] }
                             }
                         }
                         TextField { id: avatarPath; placeholderText: "Image file path (or drop file here)"; Layout.fillWidth: true }

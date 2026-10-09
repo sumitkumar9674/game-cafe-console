@@ -66,10 +66,23 @@ Item {
                 visible: page.section === "Dashboard" || page.section === "Computers"
                 Layout.fillWidth: true; Layout.fillHeight: true; spacing: 14
                 Panel {
+                    objectName: "computerManagementPanel"
                     Layout.fillWidth: true; Layout.fillHeight: true
                     ColumnLayout {
                         anchors.fill: parent; anchors.margins: 14; spacing: 10
-                        Text { text: "COMPUTERS"; color: "#aac3d0"; font.bold: true; font.pixelSize: 12 }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Text { text: "ALL COMPUTERS"; color: "#aac3d0"; font.bold: true; font.pixelSize: 12; Layout.fillWidth: true }
+                            Text { text: "SORT BY"; color: "#7892a4"; font.bold: true; font.pixelSize: 10 }
+                            ComboBox {
+                                objectName: "computerSortBox"
+                                model: ["Recent", "Name (A–Z)"]
+                                currentIndex: bridge.view.computerSort === "name" ? 1 : 0
+                                Layout.preferredWidth: 142
+                                onActivated: bridge.setComputerSort(currentIndex === 1 ? "name" : "recent")
+                                Accessible.name: "Sort computers"
+                            }
+                        }
                         ListView {
                             id: pcList
                             Layout.fillWidth: true; Layout.fillHeight: true
@@ -169,15 +182,25 @@ Item {
                     }
                 }
                 Panel {
-                    Layout.preferredWidth: Math.min(325, page.width * 0.29)
+                    objectName: "recentSessionsPanel"
+                    Layout.preferredWidth: Math.max(180, Math.min(235, page.width * 0.15))
+                    Layout.minimumWidth: 180
+                    Layout.maximumWidth: 235
                     Layout.fillHeight: true
                     ColumnLayout { anchors.fill: parent; anchors.margins: 15; spacing: 10
-                        RowLayout { Text { text: "RECENT SESSIONS"; color: "#aac3d0"; font.bold: true; font.pixelSize: 12; Layout.fillWidth: true }
-                            ActionButton { text: "All"; secondary: true; onClicked: bridge.showAllHistory() }
-                        }
-                        Text { text: bridge.historyAll ? "All PCs" : "Selected PC"; color: "#91a7ba"; font.pixelSize: 12 }
-                        ListView { id: historySide; Layout.fillWidth: true; Layout.fillHeight: true; clip: true; model: bridge.historyModel; spacing: 8
-                            Text { anchors.centerIn: parent; text: "No completed sessions yet"; color: "#718ca0"; visible: historySide.count === 0; font.pixelSize: 12 }
+                        Text { text: "RECENT SESSIONS"; color: "#aac3d0"; font.bold: true; font.pixelSize: 12; Layout.fillWidth: true }
+                        ListView { id: historySide; Layout.fillWidth: true; Layout.fillHeight: true; clip: true; model: bridge.dashboardHistoryModel; spacing: 8
+                            Text {
+                                objectName: "recentHistoryEmptyState"
+                                anchors.centerIn: parent
+                                width: parent.width - 16
+                                horizontalAlignment: Text.AlignHCenter
+                                wrapMode: Text.WordWrap
+                                text: bridge.selectedPcId ? "No sessions recorded for this PC." : "Select a computer to view recent sessions."
+                                color: "#718ca0"
+                                visible: historySide.count === 0
+                                font.pixelSize: 12
+                            }
                             delegate: Rectangle { required property var rowData; width: historySide.width; height: 84; radius: 9; color: "#223448"
                                 Column { anchors.fill: parent; anchors.margins: 9; spacing: 3
                                     Text { text: rowData.pcName; color: "#f2f8fa"; font.bold: true }
@@ -251,7 +274,7 @@ Item {
     Component { id: historyFull
         Panel { ColumnLayout { anchors.fill: parent; anchors.margins: 16
             RowLayout { Text { text: "Session history"; color: "#f4fbff"; font.pixelSize: 19; Layout.fillWidth: true }
-                ActionButton { text: "All PCs"; secondary: true; onClicked: bridge.showAllHistory() }
+                ActionButton { objectName: "allHistoryButton"; text: "All PCs"; secondary: true; onClicked: bridge.showAllHistory() }
             }
             ListView { id: fullHistory; Layout.fillWidth: true; Layout.fillHeight: true; model: bridge.historyModel; clip: true; spacing: 7
                 Text { anchors.centerIn: parent; text: "No completed sessions yet"; color: "#718ca0"; visible: fullHistory.count === 0 }
@@ -286,10 +309,22 @@ Item {
                     ColumnLayout { id: avatarSettings; anchors.fill: parent; anchors.margins: 17; spacing: 10
                         Text { text: "Cafe avatar"; color: "#f4fbff"; font.pixelSize: 19; font.bold: true }
                         RowLayout {
-                            Avatar { diameter: 65; visible: avatarPath.text === "" }
-                            Image { width: 65; height: 65; visible: avatarPath.text !== ""; fillMode: Image.PreserveAspectFit;
-                                source: avatarPath.text.startsWith("file:") ? avatarPath.text : "file:///" + avatarPath.text.replace(/\\/g, "/") }
-                            Text { text: "PNG or JPG · up to 5 MB"; color: "#91a9ba" }
+                            AvatarPreview {
+                                objectName: "avatarPreview"
+                                source: bridge.avatarPreviewSource(avatarPath.text)
+                                crop: avatarFit.currentIndex === 1
+                                Layout.preferredWidth: 184
+                                Layout.preferredHeight: 184
+                                Layout.minimumWidth: 184
+                                Layout.maximumWidth: 184
+                                Layout.minimumHeight: 184
+                                Layout.maximumHeight: 184
+                            }
+                            ColumnLayout {
+                                Text { text: "PNG or JPG · up to 5 MB"; color: "#91a9ba" }
+                                Text { text: "Preview fit"; color: "#91a9ba"; font.pixelSize: 12 }
+                                ComboBox { id: avatarFit; objectName: "avatarPreviewFit"; model: ["Fit", "Fill"] }
+                            }
                         }
                         TextField { id: avatarPath; placeholderText: "Image file path (or drop file here)"; Layout.fillWidth: true }
                         RowLayout { ActionButton { text: "Browse / Choose Image"; secondary: true; onClicked: { var selected = bridge.browseAvatar(); if (selected) avatarPath.text = selected } }

@@ -14,6 +14,7 @@ from .desktops import active_desktop_name, switch
 from .network import (NodeNetwork, authenticated_call, create_pairing_key,
                       discover, open_welcome, pairing_code, pairing_secret,
                       plain_call, seal_welcome)
+from .presentation import validate_add, validate_start
 from .security import (create_admin_signing_record, sign_admin_proof,
                        sign_node, unlock_admin_signing_key, verify_admin_proof,
                        verify_node)
@@ -46,6 +47,7 @@ class Runtime:
 
     def __init__(self, store: Store):
         self.store = store
+        self.started_at = time.time()
         self.network = NodeNetwork(store, self)
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.stop_event = threading.Event()
@@ -57,6 +59,7 @@ class Runtime:
         self.last_access_allowed: bool | None = None
         self.lock = threading.RLock()
         self.peer_statuses: dict[str, tuple[float, dict]] = {}
+        self.connection_states: dict[str, bool] = {}
         self.admin_signing_key = None
         self.lease_challenges: dict[tuple[str, str], float] = {}
         self.handoff_until = 0.0
@@ -409,6 +412,9 @@ class Runtime:
                 "expires_at": time.time() + LEASE_SECONDS,
                 "proof": sign_admin_proof(self.admin_signing_key, proof),
             }
+            member = state["members"][self.store.pc_id]
+            member["last_connected_at"] = max(
+                float(member.get("last_connected_at", 0)), self.started_at)
         self.store.update(claim)
         self.admin_ui_open = True
         self.notify("admin_ready")
@@ -493,6 +499,11 @@ class Runtime:
                 # Sign-out execution remains disabled pending a restart/recovery
                 # design, as required by the product specification.
                 state["settings"]["auto_signout_enabled"] = False
+            elif action == "computer_sort":
+                option = details.get("option")
+                if option not in ("recent", "name"):
+                    raise ValueError("Unknown computer sorting option.")
+                state["settings"]["computer_sort"] = option
             elif action == "password":
                 state["admin_password"] = hash_password(details["new_password"])
                 state["admin_signing"] = create_admin_signing_record(
@@ -637,6 +648,60 @@ class Runtime:
         self.network.call(ip, "customer_action",
                           {"action": action, "details": details})
 
+    def local_staff_session_action(self, action: str, password: str,
+                                   operation_id: str, **details) -> dict:
+        """Apply a password-authorized local grant without claiming Admin."""
+        snap = self.snapshot()
+        if not snap or not verify_password(password, snap.get("admin_password", {})):
+            raise PermissionError("Incorrect Admin password.")
+        signing_key = unlock_admin_signing_key(password, snap["admin_signing"])
+        if action not in ("start", "add") or len(operation_id) != 32:
+            raise ValueError("Invalid local Staff operation.")
+
+        with self.lock:
+            snap = self.snapshot()
+            session, history, grants = self._owner_payload()
+            if any(item["command"]["id"] == operation_id for item in grants):
+                return next(item for item in self.store.owner_records()
+                            if item["payload"]["pc_id"] == self.store.pc_id)
+            command_details: dict
+            if action == "start":
+                if session:
+                    raise ValueError("This PC already has a session.")
+                kind = str(details.get("kind", ""))
+                paid, buffer = validate_start(
+                    kind, str(details.get("paid_minutes", "")),
+                    str(details.get("buffer_minutes", "")))
+                session = sessions.start_session(kind, paid, buffer)
+                command_details = {"kind": kind, "paid_minutes": paid,
+                                   "buffer_minutes": buffer,
+                                   "source": "local_staff"}
+                session_id = session["id"]
+            else:
+                if not session:
+                    raise ValueError("This PC has no active session.")
+                minutes = validate_add(int(details.get("minutes", 0)))
+                sessions.add_paid_time(
+                    session, minutes,
+                    grace_minutes=snap["settings"]["grace_minutes"])
+                command_details = {"minutes": minutes,
+                                   "source": "local_staff"}
+                session_id = session["id"]
+            command = {
+                "id": operation_id, "pool_id": snap["pool_id"],
+                "admin_id": self.store.pc_id, "target": self.store.pc_id,
+                "term": int(snap["active_admin"].get("term", 0)),
+                "action": action, "session_id": session_id,
+                "details": command_details,
+            }
+            grant = {"command": command,
+                     "signature": sign_node(self.store.node_private_key(), command),
+                     "admin_proof": sign_admin_proof(signing_key, command)}
+            grants.append(grant)
+            record = self._save_owner_state(session, history, grants)
+            self._reconcile_local_access()
+            return record
+
     def _customer_action(self, action: str, details: dict, sender: str) -> None:
         self._require_admin()
         if action == "end":
@@ -767,7 +832,8 @@ class Runtime:
         if not name or len(name) > 40:
             raise ValueError("PC name must be 1 to 40 characters.")
         updated = self.change(lambda state: state["members"].update(
-            {pc_id: {"name": name, "public_key": pending["public_key"]}}
+            {pc_id: {"name": name, "public_key": pending["public_key"],
+                     "last_connected_at": time.time()}}
         ))
         welcome = {"snapshot": updated, "secret": self.store.secret(),
                    "pc_id": pc_id}
@@ -947,6 +1013,7 @@ class Runtime:
                  and item["pc_id"] != self.store.pc_id]
         if not peers:
             return
+        successful: set[str] = set()
         with ThreadPoolExecutor(max_workers=min(8, len(peers))) as executor:
             futures = {executor.submit(self.network.call, item["ip"], "status", {}): item
                        for item in peers}
@@ -956,15 +1023,36 @@ class Runtime:
                     status = future.result()
                     if status.get("pc_id") != item["pc_id"]:
                         continue
+                    successful.add(item["pc_id"])
                     self.store.note_peer(item["pc_id"], item["ip"])
                     with self.lock:
                         self.peer_statuses[item["pc_id"]] = (time.time(), status)
+                    previous = self.connection_states.get(item["pc_id"])
+                    self.connection_states[item["pc_id"]] = True
+                    if previous is False and self.is_admin():
+                        self._record_member_connection(item["pc_id"])
                     records = self.network.call(item["ip"], "session_records", {})["records"]
                     for record in records:
                         if self.store.merge_owner_record(record):
                             self.notify("changed")
                 except Exception:
                     pass
+        for item in peers:
+            pc_id = item["pc_id"]
+            if pc_id not in successful and self.peer_status(pc_id) is None:
+                self.connection_states[pc_id] = False
+
+    def _record_member_connection(self, pc_id: str,
+                                  connected_at: float | None = None) -> None:
+        """Persist only a confirmed offline-to-online transition."""
+        connected_at = time.time() if connected_at is None else connected_at
+
+        def record(state):
+            member = state["members"].get(pc_id)
+            if member is not None:
+                member["last_connected_at"] = connected_at
+
+        self.change(record)
 
     def _settle_admin_ownership(self) -> None:
         """A reachable higher claim wins; inactive PCs follow a live Admin."""

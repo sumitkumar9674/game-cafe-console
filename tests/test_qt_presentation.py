@@ -5,7 +5,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import base64
 from pathlib import Path
+import queue
 from tempfile import TemporaryDirectory
+import threading
 import time
 import unittest
 from unittest.mock import Mock, patch
@@ -15,6 +17,8 @@ from PySide6.QtGui import QImage
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtWidgets import QApplication
 
+from game_cafe import sessions
+from game_cafe.branding import app_logo_source, valid_image
 from game_cafe.qt_bridge import CafeBridge, RecordListModel
 from game_cafe.qt_app import AvatarProvider
 from game_cafe.storage import Store, new_pool
@@ -30,7 +34,9 @@ class QtPresentationTest(unittest.TestCase):
         self.store = Store(Path(self.temp.name) / "cafe.sqlite3")
         self.host = Mock()
         self.host.console_transitioning = False
+        self.host.console_process = None
         self.runtime = Mock()
+        self.runtime.events = queue.Queue()
         self.bridge = CafeBridge(self.store, self.host, self.runtime)
 
     def tearDown(self):
@@ -73,6 +79,51 @@ class QtPresentationTest(unittest.TestCase):
         self.bridge.showAllHistory()
         self.assertTrue(self.bridge.historyAll)
 
+    def test_dashboard_history_waits_for_an_immutable_pc_selection(self):
+        snapshot, secret = new_pool(
+            "Cafe", self.store.pc_id, "PC-01", "Admin",
+            "long test password", self.store.node_public_key())
+        pc_id = "b" * 32
+        snapshot["members"][pc_id] = {
+            "name": "PC-02", "public_key": "b" * 64}
+        session = sessions.start_session("timed", 30, 0, now=time.time() - 60)
+        snapshot["history"][pc_id] = [sessions.finish_session(
+            session, pc_id, "PC-02", "admin", time.time())]
+        self.store.save_pool(snapshot, secret, join=True)
+        self.runtime.status.return_value = {"desktop": "Default"}
+        self.runtime.peer_status.return_value = None
+        self.runtime.is_admin.return_value = True
+        initial = self.bridge._collect_state("", True)
+        self.assertEqual(initial["dashboardHistory"], [])
+        self.assertEqual(len(initial["history"]), 1)
+        selected = self.bridge._collect_state(pc_id, False)
+        self.assertEqual(len(selected["dashboardHistory"]), 1)
+        self.assertEqual(selected["dashboardHistory"][0]["pcName"], "PC-02")
+
+    def test_sorting_preserves_selection_expansion_and_command_target(self):
+        rows = [
+            {"pcId": "pc-10", "name": "PC-10", "unlockRequested": False,
+             "start": True},
+            {"pcId": "pc-2", "name": "PC-02", "unlockRequested": False,
+             "start": True},
+        ]
+        self.bridge.pc_model.update_rows(rows)
+        with patch.object(self.bridge, "refresh"):
+            self.bridge.selectPc("pc-10")
+            self.bridge.pc_model.update_rows(list(reversed(rows)))
+            self.bridge.setComputerSort("name")
+            self.wait_for_idle()
+            self.assertEqual(self.bridge.selectedPcId, "pc-10")
+            self.assertEqual(self.bridge.expandedPcId, "pc-10")
+            self.runtime.admin_action.assert_called_once_with(
+                "computer_sort", option="name")
+            self.runtime.admin_action.reset_mock()
+            self.bridge.startSession("pc-10", "timed", "60", "0")
+            self.wait_for_idle()
+        self.runtime.admin_action.assert_called_once_with(
+            "start", "pc-10", kind="timed", paid_minutes=60,
+            buffer_minutes=0)
+
     def test_all_qml_surfaces_load(self):
         self.bridge.pc_model.update_rows([{
             "pcId": "b", "name": "PC-02", "role": "USER", "online": True,
@@ -94,24 +145,143 @@ class QtPresentationTest(unittest.TestCase):
         loader = root.findChild(QObject, "mainLoader")
         self.assertIsNotNone(loader)
         # Loading every route catches missing QML imports without creating a real desktop.
-        for mode in ("onboarding", "joining", "candidate", "admin", "widget", "console"):
+        for mode in ("onboarding", "joining", "candidate", "admin", "widget",
+                     "compact", "console"):
             self.bridge._set_mode(mode)
             self.app.processEvents()
             self.assertEqual(self.bridge.mode, mode)
             self.assertIsNotNone(loader.property("item"), mode)
         password = root.findChild(QObject, "staffPasswordField")
-        visibility = root.findChild(QObject, "showStaffPassword")
         self.assertIsNotNone(password)
-        self.assertIsNotNone(visibility)
         password.setProperty("text", "temporary test password")
         self.app.processEvents()
         self.assertNotEqual(password.property("displayText"), "temporary test password")
-        visibility.setProperty("checked", True)
+        password.setProperty("passwordVisible", True)
         self.app.processEvents()
         self.assertEqual(password.property("displayText"), "temporary test password")
-        visibility.setProperty("checked", False)
+        password.setProperty("passwordVisible", False)
         self.app.processEvents()
         self.assertNotEqual(password.property("displayText"), "temporary test password")
+
+    def test_admin_password_is_hidden_and_can_be_revealed(self):
+        self.bridge._set_mode("candidate")
+        engine = QQmlApplicationEngine()
+        engine.rootContext().setContextProperty("bridge", self.bridge)
+        qml = Path(__file__).resolve().parents[1] / "game_cafe" / "qml" / "App.qml"
+        engine.load(QUrl.fromLocalFile(str(qml)))
+        root = engine.rootObjects()[0]
+        password = root.findChild(QObject, "adminPasswordField")
+        self.assertIsNotNone(password)
+        password.setProperty("text", "temporary test password")
+        self.app.processEvents()
+        self.assertNotEqual(password.property("displayText"), "temporary test password")
+        password.setProperty("passwordVisible", True)
+        self.app.processEvents()
+        self.assertEqual(password.property("displayText"), "temporary test password")
+        password.setProperty("passwordVisible", False)
+        self.assertEqual(password.property("text"), "temporary test password")
+
+    def test_admin_login_uses_responsive_splash_and_failure_retry(self):
+        gate = threading.Event()
+        event_loop_ran = threading.Event()
+
+        def fail_login(_password):
+            gate.wait(2)
+            raise PermissionError("Incorrect Admin password.")
+
+        self.runtime.take_admin.side_effect = fail_login
+        self.bridge._set_mode("candidate")
+        self.bridge.claimAdmin("wrong password")
+        self.assertEqual(self.bridge.mode, "splash")
+        self.assertTrue(self.bridge.busy)
+        self.assertIn("synchronizing", self.bridge.statusText)
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, event_loop_ran.set)
+        self.app.processEvents()
+        self.assertTrue(event_loop_ran.is_set())
+        gate.set()
+        self.wait_for_idle()
+        self.assertEqual(self.bridge.mode, "candidate")
+        self.assertTrue(self.bridge.view["adminLoginFailed"])
+        self.assertEqual(self.bridge.notice["title"], "Admin login failed")
+
+    def test_admin_login_success_prepares_dashboard_off_thread(self):
+        self.bridge._set_mode("candidate")
+        self.runtime.take_admin.return_value = None
+        self.bridge.claimAdmin("correct password")
+        self.wait_for_idle()
+        self.assertEqual(self.bridge.mode, "admin")
+        self.runtime.take_admin.assert_called_once_with("correct password")
+        self.host.stop_console.assert_called_once()
+
+    def test_dashboard_history_width_and_avatar_preview_are_bounded(self):
+        self.bridge._set_view(settings={"cafeName": "Cafe", "adminName": "Admin",
+                                      "graceMinutes": 10, "signoutMinutes": 0})
+        self.bridge._set_mode("admin")
+        engine = QQmlApplicationEngine()
+        engine.rootContext().setContextProperty("bridge", self.bridge)
+        qml = Path(__file__).resolve().parents[1] / "game_cafe" / "qml" / "App.qml"
+        engine.load(QUrl.fromLocalFile(str(qml)))
+        root = engine.rootObjects()[0]
+        history = computers = None
+        for width in (1100, 1600):
+            root.setProperty("width", width)
+            self.app.processEvents()
+            history = root.findChild(QObject, "recentSessionsPanel")
+            computers = root.findChild(QObject, "computerManagementPanel")
+            self.assertIsNotNone(history)
+            self.assertIsNotNone(computers)
+            self.assertGreaterEqual(history.property("width"), 180)
+            self.assertLessEqual(history.property("width"), 235)
+            self.assertGreater(computers.property("width"), history.property("width"))
+        sort_box = root.findChild(QObject, "computerSortBox")
+        self.assertIsNotNone(sort_box)
+        self.assertEqual(sort_box.property("count"), 2)
+        empty_history = root.findChild(QObject, "recentHistoryEmptyState")
+        self.assertIsNotNone(empty_history)
+        self.assertEqual(empty_history.property("text"),
+                         "Select a computer to view recent sessions.")
+        self.bridge.pc_model.update_rows([{"pcId": "selected-pc",
+                                           "unlockRequested": False}])
+        with patch.object(self.bridge, "refresh"):
+            self.bridge.selectPc("selected-pc")
+        self.app.processEvents()
+        self.assertEqual(empty_history.property("text"),
+                         "No sessions recorded for this PC.")
+        admin = root.findChild(QObject, "mainLoader").property("item")
+        admin.setProperty("section", "History")
+        self.app.processEvents()
+        self.assertIsNotNone(root.findChild(QObject, "allHistoryButton"))
+        admin.setProperty("section", "Settings")
+        self.app.processEvents()
+        preview = root.findChild(QObject, "avatarPreview")
+        self.assertIsNotNone(preview)
+        self.assertEqual(preview.property("width"), 184)
+        self.assertEqual(preview.property("height"), 184)
+        self.assertEqual(self.bridge.avatarPreviewSource(""), "")
+        self.assertEqual(self.bridge.avatarPreviewSource("missing.png"), "")
+        valid = Path(self.temp.name) / "transparent.png"
+        image = QImage(8, 8, QImage.Format_ARGB32)
+        image.fill(0)
+        self.assertTrue(image.save(str(valid)))
+        self.assertTrue(self.bridge.avatarPreviewSource(str(valid)).startswith("file:"))
+
+    def test_optional_branding_and_build_fallback(self):
+        missing = Path(self.temp.name) / "missing.png"
+        self.assertFalse(valid_image(missing))
+        with patch("game_cafe.branding.APP_LOGO_PATH", missing):
+            self.assertEqual(app_logo_source(), "")
+        valid = Path(self.temp.name) / "logo.png"
+        image = QImage(10, 6, QImage.Format_ARGB32)
+        image.fill("#35c7c7")
+        self.assertTrue(image.save(str(valid)))
+        with patch("game_cafe.branding.APP_LOGO_PATH", valid):
+            self.assertTrue(app_logo_source().startswith("file:"))
+        build = (Path(__file__).resolve().parents[1] /
+                 "build_game_cafe.ps1").read_text(encoding="utf-8-sig")
+        self.assertIn('Test-Path -LiteralPath $iconPath', build)
+        self.assertIn('@("--icon", $iconPath)', build)
+        self.assertIn('game_cafe\\assets;game_cafe\\assets', build)
 
     def test_saved_pool_identity_is_unchanged_by_qt_bridge(self):
         pc_id = self.store.pc_id
@@ -167,7 +337,9 @@ class QtPresentationTest(unittest.TestCase):
         self.wait_for_idle()
         args, kwargs = self.runtime.admin_action.call_args
         self.assertEqual(args, ("logo",))
-        self.assertTrue(base64.b64decode(kwargs["logo"]).startswith(b"\x89PNG"))
+        uploaded = base64.b64decode(kwargs["logo"])
+        self.assertTrue(uploaded.startswith(b"\x89PNG"))
+        self.assertTrue(QImage.fromData(uploaded).hasAlphaChannel())
 
     def test_unregistered_startup_opens_onboarding(self):
         with patch("game_cafe.qt_bridge.discover", return_value=[]):

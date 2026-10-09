@@ -40,6 +40,8 @@ ApplicationWindow {
             confirmAdminExit()
         } else if (bridge.mode === "widget") {
             bridge.hideWidget()
+        } else if (bridge.mode === "compact") {
+            bridge.expandWidget()
         } else {
             bridge.closeApplication()
         }
@@ -49,6 +51,7 @@ ApplicationWindow {
         anchors.fill: parent
         source: bridge.mode === "admin" ? "Admin.qml" :
                 bridge.mode === "console" ? "Console.qml" :
+                bridge.mode === "compact" ? "CompactTimer.qml" :
                 bridge.mode === "widget" ? "Widget.qml" :
                 bridge.mode === "splash" ? "Splash.qml" : "Onboarding.qml"
     }

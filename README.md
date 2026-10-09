@@ -37,6 +37,12 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build_game_cafe.ps1
 
 The result is the **whole** `dist\GameCafeConsole\` folder, including `GameCafeConsole.exe`, Qt DLLs/plugins, and QML resources. Copy the whole folder—not only the EXE—to another Windows PC. The same EXE re-launches as the CafeConsole child. The one-folder layout is suitable for later installer work; do not ship a café's SQLite database inside it. Rebuild and update both PCs together when testing protocol/UI changes.
 
+Optional branding belongs in `game_cafe\assets\branding`: use `app_icon.ico`
+for the EXE/title/taskbar icon and `app_logo.png` for the startup/Admin-login
+loading screen. The build discovers the icon automatically and packages the
+assets directory. Missing or invalid artwork safely uses the standard icon and
+the existing StickForYou text fallback.
+
 PyInstaller and Qt's `pyside6-deploy` are both viable deployment routes. This project keeps PyInstaller for now because its existing Windows child-process re-exec path works with a one-folder bundle and the QML files can be included explicitly. A packaged build still needs a supervised two-PC smoke test, especially Qt Quick rendering on CafeConsole. The child selects Qt Quick's software graphics API before its first window as a compatibility fallback; confirm its appearance and performance on target machines.
 
 For commercial distribution, review the exact PySide6/Qt modules and their LGPLv3/GPLv3 or commercial license terms, attribution/notice, and applicable redistribution and relinking obligations. Bundling Qt DLLs alone does not settle compliance. Get qualified legal review before client release.

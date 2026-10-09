@@ -8,16 +8,19 @@ from pathlib import Path
 import queue
 import time
 from typing import Callable
+import uuid
 
 from PySide6.QtCore import (QAbstractListModel, QByteArray, QModelIndex,
-                            QObject, Property, Qt, QTimer, Signal, Slot)
+                            QObject, Property, Qt, QTimer, QUrl, Signal, Slot)
 from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QFileDialog
 
 from . import desktops, sessions
+from .branding import app_logo_source
 from .network import discover
 from .presentation import (add_time_preview, duration, history_rows,
-                           pc_row_data, validate_add, validate_start)
+                           pc_row_data, sort_pc_rows, validate_add,
+                           validate_start)
 from .runtime import Runtime
 from .security import open_local_password, seal_local_password
 from .storage import Store, new_pool, verify_password
@@ -72,6 +75,7 @@ class CafeBridge(QObject):
     busyChanged = Signal()
     statusChanged = Signal()
     noticeChanged = Signal()
+    staffAuthChanged = Signal()
     workFinished = Signal(str, object, object)
 
     def __init__(self, store: Store, host, runtime: Runtime | None = None,
@@ -85,7 +89,9 @@ class CafeBridge(QObject):
         self._view: dict = {"cafeName": "Game Cafe Console", "hasAvatar": False,
                             "avatarSource": "", "developer": DEVELOPER_NAME,
                             "brand": DEVELOPER_BRAND, "website": DEVELOPER_WEBSITE,
-                            "email": DEVELOPER_EMAIL}
+                            "email": DEVELOPER_EMAIL,
+                            "appLogoSource": app_logo_source(),
+                            "adminLoginFailed": False}
         self._status = "Starting Game Cafe Console"
         self._notice: dict = {}
         self._busy = False
@@ -103,9 +109,15 @@ class CafeBridge(QObject):
         self._cooldown_until = 0.0
         self._previous_session_id = None
         self._shutting_down = False
+        self._staff_authorized_until = 0.0
+        self._staff_credential: dict | None = None
+        self._staff_verifier: dict | None = None
+        self._staff_failed_attempts = 0
+        self._staff_blocked_until = 0.0
         self._runtime_started = False
         self.pc_model = RecordListModel("pcId", self)
         self.history_model = RecordListModel("id", self)
+        self.dashboard_history_model = RecordListModel("id", self)
         self.join_model = RecordListModel("requestId", self)
         self.member_model = RecordListModel("pcId", self)
         self.workFinished.connect(self._on_work_finished)
@@ -160,6 +172,10 @@ class CafeBridge(QObject):
         return self.history_model
 
     @Property(QObject, constant=True)
+    def dashboardHistoryModel(self):
+        return self.dashboard_history_model
+
+    @Property(QObject, constant=True)
     def joinModel(self):
         return self.join_model
 
@@ -170,6 +186,10 @@ class CafeBridge(QObject):
     @Property(bool, constant=True)
     def childMode(self):
         return self.child
+
+    @Property(bool, notify=staffAuthChanged)
+    def staffAuthorized(self):
+        return self._staff_is_authorized()
 
     def _set_mode(self, mode: str) -> None:
         if mode != self._mode:
@@ -334,12 +354,21 @@ class CafeBridge(QObject):
     @Slot(str)
     def claimAdmin(self, password: str) -> None:
         if not password:
+            self._show_notice("Admin password required",
+                              "Enter the Admin password, then try again.", True)
             return
-        self._set_status("Authenticating Admin and checking LAN")
+        self._set_view(adminLoginFailed=False)
+        self._set_status("Authenticating Admin, connecting, and synchronizing cafe data")
+        # Show the responsive splash while authentication runs off the Qt thread.
+        self._set_mode("splash")
         def done(result, error):
             if error:
-                self._show_notice("Admin unavailable", str(error), True)
+                self._set_view(adminLoginFailed=True)
+                self._set_status("Admin login failed. Enter the password and retry.")
+                self._set_mode("candidate")
+                self._show_notice("Admin login failed", str(error), True)
             else:
+                self._set_status("Admin authenticated. Preparing the dashboard")
                 self._enter_admin()
         self._submit("claim", lambda: self.runtime.take_admin(password),
                      done, blocking=True)
@@ -355,7 +384,7 @@ class CafeBridge(QObject):
             return
         if self.host.console_transitioning:
             return
-        self._set_status("Loading Admin Dashboard")
+        self._set_status("Preparing the Admin Dashboard")
         self._set_mode("splash")
         self.host.console_transitioning = True
         def done(result, error):
@@ -477,6 +506,8 @@ class CafeBridge(QObject):
                             self.runtime.peer_status(pc_id) if self.runtime else None,
                             now)
                 for pc_id in snap["members"]] if self.runtime else []
+        computer_sort = snap.get("settings", {}).get("computer_sort", "recent")
+        rows = sort_pc_rows(rows, snap, computer_sort)
         session = snap["sessions"].get(own)
         phase = sessions.phase(session, now, snap["settings"]["grace_minutes"])
         remaining = sessions.remaining_seconds(
@@ -488,6 +519,7 @@ class CafeBridge(QObject):
         return {
             "snapshot": snap, "rows": rows,
             "history": history_rows(snap, None if all_history else selected),
+            "dashboardHistory": history_rows(snap, selected) if selected else [],
             "joins": [{"requestId": item["request_id"],
                        "pcId": item["pc_id"], "name": item["proposed_name"],
                        "ip": item["ip"], "attempts": item["attempts"]}
@@ -518,6 +550,7 @@ class CafeBridge(QObject):
                          "adminName": snap["admin_name"],
                          "graceMinutes": snap["settings"]["grace_minutes"],
                          "signoutMinutes": snap["settings"]["auto_signout_minutes"]},
+            "computerSort": computer_sort,
             "poolId": snap["pool_id"],
             "unlockRequests": sum(bool(value) for value in snap["unlock_requests"].values()),
             "onlineCount": sum(row["online"] for row in rows),
@@ -548,18 +581,23 @@ class CafeBridge(QObject):
                 return
             self.pc_model.update_rows(result.pop("rows"))
             self.history_model.update_rows(result.pop("history"))
+            self.dashboard_history_model.update_rows(
+                result.pop("dashboardHistory"))
             self.join_model.update_rows(result.pop("joins"))
             self.member_model.update_rows(result.pop("members"))
             snap = result.pop("snapshot")
             if self.child:
                 session_id = result["session"]["id"] if result["session"] else None
+                if (self._previous_session_id is not None
+                        and session_id != self._previous_session_id):
+                    self._revoke_staff()
                 if session_id != self._previous_session_id:
                     self._previous_session_id = session_id
                     self.store.set_local("customer_feedback", "")
                 result["requestCooldown"] = max(0, int(self._cooldown_until - time.time()))
             result.pop("session")
             self._set_view(**result)
-            if self._mode == "widget":
+            if self._mode in ("widget", "compact"):
                 self.host.update_widget_access(bool(result["accessAllowed"]))
         self._submit("refresh", lambda: self._collect_state(selected, all_history), done)
 
@@ -578,6 +616,17 @@ class CafeBridge(QObject):
         self._history_all = True
         self.selectionChanged.emit()
         self.refresh()
+
+    @Slot(str)
+    def setComputerSort(self, option: str) -> None:
+        if option not in ("recent", "name"):
+            self._show_notice("Sorting unavailable",
+                              "Choose Recent or Name (A–Z).", True)
+            return
+        if self._view.get("computerSort", "recent") == option:
+            return
+        self._action("computer_sort", lambda: self.runtime.admin_action(
+            "computer_sort", option=option))
 
     @Slot()
     def selectFirstUnlock(self) -> None:
@@ -724,7 +773,7 @@ class CafeBridge(QObject):
                 buffer.close()
                 return data
             data = encoded_image("PNG")
-            if data.size() > 220_000:
+            if data.size() > 220_000 and not image.hasAlphaChannel():
                 data = encoded_image("JPG", 82)
             if data.size() > 256_000:
                 raise ValueError("Image is still too large after resizing.")
@@ -742,6 +791,19 @@ class CafeBridge(QObject):
         path, _ = QFileDialog.getOpenFileName(
             None, "Choose cafe image", "", "Images (*.png *.jpg *.jpeg)")
         return path
+
+    @Slot(str, result=str)
+    def avatarPreviewSource(self, path: str) -> str:
+        """Return a QML-safe URL only when the selected image is readable."""
+        clean = path.strip().strip('"')
+        if clean.startswith("file:"):
+            clean = QUrl(clean).toLocalFile()
+        source = Path(clean) if clean else None
+        if (not source or source.suffix.lower() not in (".png", ".jpg", ".jpeg")
+                or not source.is_file() or source.stat().st_size > 5_000_000
+                or QImage(str(source)).isNull()):
+            return ""
+        return QUrl.fromLocalFile(str(source)).toString()
 
     @Slot(str)
     def searchOtherPools(self, password: str) -> None:
@@ -802,28 +864,157 @@ class CafeBridge(QObject):
             payload = {"password_sealed": seal_local_password(
                 public, payload["password"])}
         self.store.set_local("customer_feedback", "Saving on this PC…" if action in
-                             ("end", "rename", "close_software") else "Sending request to Admin…")
+                             ("end", "rename", "close_software", "staff_start",
+                              "staff_add") else "Sending request to Admin…")
         self.store.post_local_command(action, payload)
         self._set_view(feedback=self.store.local("customer_feedback"))
 
+    def _staff_is_authorized(self) -> bool:
+        if (not self.child or not self._staff_credential
+                or time.monotonic() >= self._staff_authorized_until):
+            return False
+        snap = self.store.snapshot()
+        return bool(snap and snap.get("admin_password") == self._staff_verifier)
+
+    def _revoke_staff(self) -> None:
+        was_authorized = bool(self._staff_credential)
+        self._staff_authorized_until = 0.0
+        self._staff_credential = None
+        self._staff_verifier = None
+        if was_authorized:
+            self.staffAuthChanged.emit()
+
+    def _require_staff(self) -> dict | None:
+        if not self._staff_is_authorized():
+            self._revoke_staff()
+            self._show_notice("Staff access locked",
+                              "Enter the Admin password again.", True)
+            return None
+        self._staff_authorized_until = time.monotonic() + 60
+        return dict(self._staff_credential or {})
+
     @Slot(str)
-    def switchAdmin(self, password: str) -> None:
+    def authenticateStaff(self, password: str) -> None:
+        if not self.child or self._busy:
+            return
+        if time.monotonic() < self._staff_blocked_until:
+            remaining = max(1, int(self._staff_blocked_until - time.monotonic()))
+            self._show_notice("Staff access temporarily locked",
+                              f"Wait {remaining} seconds before retrying.", True)
+            return
+
+        def work():
+            snap = self.store.snapshot()
+            verifier = snap.get("admin_password") if snap else None
+            public = self.store.local("controller_command_public")
+            if not verifier or not public:
+                raise PermissionError("A trusted local Staff verifier is unavailable.")
+            if not verify_password(password, verifier):
+                raise PermissionError("Incorrect Admin password.")
+            return verifier, seal_local_password(public, password)
+
+        def done(result, error):
+            if error:
+                self._revoke_staff()
+                self._staff_failed_attempts += 1
+                if self._staff_failed_attempts >= 5:
+                    self._staff_failed_attempts = 0
+                    self._staff_blocked_until = time.monotonic() + 30
+                    message = "Too many attempts. Staff access is locked for 30 seconds."
+                else:
+                    message = str(error)
+                self._show_notice("Staff authentication failed", message, True)
+                return
+            self._staff_failed_attempts = 0
+            self._staff_blocked_until = 0.0
+            self._staff_verifier, self._staff_credential = result
+            self._staff_authorized_until = time.monotonic() + 60
+            self.staffAuthChanged.emit()
+
+        self._submit("staff_auth", work, done, blocking=True)
+
+    @Slot()
+    def touchStaffAccess(self) -> None:
+        if self._staff_is_authorized():
+            self._staff_authorized_until = time.monotonic() + 60
+
+    @Slot()
+    def lockStaffAccess(self) -> None:
+        self._revoke_staff()
+
+    @Slot(str, str, str)
+    def staffStartSession(self, kind: str, paid: str, buffer: str) -> None:
+        credential = self._require_staff()
+        if credential is None:
+            return
+        try:
+            paid_minutes, buffer_minutes = validate_start(kind, paid, buffer)
+        except Exception as error:
+            self._show_notice("Invalid session", str(error), True)
+            self._revoke_staff()
+            return
+        self._post_child("staff_start", {
+            "password_sealed": credential,
+            "operation_id": uuid.uuid4().hex,
+            "kind": kind, "paid_minutes": paid_minutes,
+            "buffer_minutes": buffer_minutes,
+        })
+        self._revoke_staff()
+
+    @Slot(int, result=str)
+    def previewStaffAdd(self, minutes: int) -> str:
+        if not self._staff_is_authorized():
+            return ""
+        try:
+            return add_time_preview(self.store.snapshot(), self.store.pc_id,
+                                    validate_add(minutes))
+        except Exception as error:
+            return str(error)
+
+    @Slot(int)
+    def staffAddTime(self, minutes: int) -> None:
+        credential = self._require_staff()
+        if credential is None:
+            return
+        try:
+            minutes = validate_add(minutes)
+        except Exception as error:
+            self._show_notice("Invalid added time", str(error), True)
+            self._revoke_staff()
+            return
+        self._post_child("staff_add", {
+            "password_sealed": credential,
+            "operation_id": uuid.uuid4().hex, "minutes": minutes,
+        })
+        self._revoke_staff()
+
+    @Slot()
+    def switchAdmin(self) -> None:
         if self.child:
+            credential = self._require_staff()
+            if credential is None:
+                return
             if self._view.get("hasSession"):
                 self._show_notice("Session active",
                                   "End this session before switching to Admin.", True)
+                self._revoke_staff()
                 return
-            self._post_child("open_admin", {"password": password})
+            self._post_child("open_admin", {"password_sealed": credential})
+            self._revoke_staff()
 
-    @Slot(str)
-    def closeSoftware(self, password: str) -> None:
+    @Slot()
+    def closeSoftware(self) -> None:
         if self.child:
-            self._post_child("close_software", {"password": password})
+            credential = self._require_staff()
+            if credential is not None:
+                self._post_child("close_software", {"password_sealed": credential})
+                self._revoke_staff()
 
     @Slot()
     def goDesktop(self) -> None:
         if not self.child or not self._view.get("accessAllowed"):
             return
+        self._revoke_staff()
         try:
             desktops.switch(self.host.default_handle)
         except OSError as error:
@@ -840,6 +1031,21 @@ class CafeBridge(QObject):
             self.host.hide_widget()
 
     @Slot()
+    def compactTimer(self) -> None:
+        if not self.child:
+            self.host.show_compact_timer()
+
+    @Slot()
+    def expandWidget(self) -> None:
+        if not self.child:
+            self.host.expand_widget()
+
+    @Slot()
+    def clampCompactTimer(self) -> None:
+        if not self.child:
+            self.host.clamp_compact_timer()
+
+    @Slot()
     def closeAdmin(self) -> None:
         self.closeApplication()
 
@@ -852,6 +1058,12 @@ class CafeBridge(QObject):
         if self._shutting_down:
             return
         if self.child:
+            active_desktop = desktops.active_desktop_name()
+            if (self._staff_credential and active_desktop
+                    and active_desktop != "CafeConsole"):
+                self._revoke_staff()
+            if self._staff_credential and not self._staff_is_authorized():
+                self._revoke_staff()
             self.host.check_child_liveness()
             return
         try:
@@ -926,9 +1138,33 @@ class CafeBridge(QObject):
                 else:
                     self.host.shutdown()
             self._submit("close_software", work, done, blocking=True)
+        elif action in ("staff_start", "staff_add"):
+            def work():
+                password = open_local_password(self.host.command_private_key,
+                                               payload["password_sealed"])
+                details = ({"kind": payload["kind"],
+                            "paid_minutes": payload["paid_minutes"],
+                            "buffer_minutes": payload["buffer_minutes"]}
+                           if action == "staff_start" else
+                           {"minutes": payload["minutes"]})
+                return self.runtime.local_staff_session_action(
+                    "start" if action == "staff_start" else "add",
+                    password, payload["operation_id"], **details)
+
+            def done(result, error):
+                self.store.set_local(
+                    "customer_feedback",
+                    f"Staff action failed: {error}" if error else
+                    "Staff session change saved locally.")
+                if error:
+                    self._show_notice("Staff action failed", str(error), True)
+                self.refresh()
+
+            self._submit(action, work, done, blocking=True)
 
     def shutdown(self) -> None:
         self._shutting_down = True
+        self._revoke_staff()
         self.tick_timer.stop()
         self.refresh_timer.stop()
         self.join_timer.stop()

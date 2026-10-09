@@ -11,7 +11,7 @@ Item {
             Layout.alignment: Qt.AlignHCenter; spacing: 22
             Avatar { diameter: 86 }
             Rectangle { width: 1; height: 72; color: "#466070" }
-            Text { text: "StickForYou"; color: "#f5fbff"; font.pixelSize: 28; font.bold: true }
+            BrandLogo { Layout.preferredWidth: 190; Layout.preferredHeight: 86 }
         }
         Text { text: "GAME CAFE CONSOLE"; color: "#f6fbff"; font.pixelSize: 30; font.bold: true; Layout.alignment: Qt.AlignHCenter }
         Text { text: "Powered by StickForYou"; color: "#35c7c7"; font.pixelSize: 15; Layout.alignment: Qt.AlignHCenter }

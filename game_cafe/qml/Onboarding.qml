@@ -35,10 +35,17 @@ Item {
                     TextField { id: cafe; placeholderText: "Cafe name"; Layout.fillWidth: true; visible: page.tab === "create" }
                     TextField { id: pc; placeholderText: "This PC name"; Layout.fillWidth: true; visible: page.tab === "create" }
                     TextField { id: admin; placeholderText: "Admin name"; Layout.fillWidth: true; visible: page.tab === "create" }
-                    TextField { id: password; placeholderText: "Admin password"; echoMode: TextInput.Password; Layout.fillWidth: true; visible: page.tab !== "discover" }
+                    PasswordField {
+                        id: password
+                        objectName: "adminPasswordField"
+                        placeholderText: "Admin password"
+                        Layout.fillWidth: true
+                        visible: page.tab !== "discover"
+                        onAccepted: if (page.tab === "admin") bridge.claimAdmin(text)
+                    }
                     TextField { id: confirmation; placeholderText: "Confirm password"; echoMode: TextInput.Password; Layout.fillWidth: true; visible: page.tab === "create" }
                     ActionButton { text: "Create and open Admin Dashboard"; visible: page.tab === "create"; onClicked: bridge.createCafe(cafe.text, pc.text, admin.text, password.text, confirmation.text) }
-                    ActionButton { text: "Become Admin"; visible: page.tab === "admin"; onClicked: bridge.claimAdmin(password.text) }
+                    ActionButton { text: bridge.view.adminLoginFailed ? "Retry Admin Login" : "Become Admin"; visible: page.tab === "admin"; onClicked: bridge.claimAdmin(password.text) }
                     ActionButton { text: "Continue as User"; secondary: true; visible: bridge.mode === "candidate"; onClicked: bridge.stayUser() }
                     ActionButton { text: "Search LAN"; secondary: true; visible: page.tab === "discover"; onClicked: bridge.searchPools() }
                     Repeater {

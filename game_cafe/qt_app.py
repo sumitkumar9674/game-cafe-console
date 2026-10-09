@@ -6,14 +6,15 @@ import base64
 from pathlib import Path
 import sys
 
-from PySide6.QtCore import QCoreApplication, QEvent, Qt, QTimer, QUrl
-from PySide6.QtGui import QGuiApplication, QImage
+from PySide6.QtCore import QCoreApplication, QEvent, QPoint, Qt, QTimer, QUrl
+from PySide6.QtGui import QGuiApplication, QIcon, QImage
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuick import QQuickImageProvider, QQuickWindow, QSGRendererInterface
 from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtWidgets import QApplication, QMenu, QStyle, QSystemTrayIcon
 
 from . import desktops
+from .branding import APP_ICON_PATH
 from .qt_bridge import CafeBridge
 from .runtime import Runtime
 from .security import create_local_command_key
@@ -39,6 +40,9 @@ class AvatarProvider(QQuickImageProvider):
 
 class QtHost:
     def _load_ui(self):
+        branded_icon = QIcon(str(APP_ICON_PATH)) if APP_ICON_PATH.is_file() else QIcon()
+        if not branded_icon.isNull():
+            self.app.setWindowIcon(branded_icon)
         QQuickStyle.setStyle("Material")
         self.engine = QQmlApplicationEngine()
         self.engine.addImageProvider("cafe", AvatarProvider(self.store))
@@ -50,21 +54,49 @@ class QtHost:
         if not roots:
             raise RuntimeError(f"Could not load Qt UI: {qml}")
         self.window = roots[0]
+        self.standard_window_flags = self.window.flags()
+        self.current_window_mode = ""
+        if not self.app.windowIcon().isNull():
+            self.window.setIcon(self.app.windowIcon())
 
     def configure_window(self, mode: str):
         if self.child:
             self.window.showFullScreen()
             return
-        # Only the User widget needs a tray entry for Hide / reopen.
+        previous_mode = self.current_window_mode
+        self.current_window_mode = mode
+        # Only the full User widget needs a tray entry for Hide / reopen.
         if hasattr(self, "tray"):
             self.tray.setVisible(mode == "widget" and
                                  QSystemTrayIcon.isSystemTrayAvailable())
         if mode == "admin":
             self.widget_user_hidden = False
+        if mode == "compact":
+            self.window.setFlags(Qt.Tool | Qt.FramelessWindowHint |
+                                 Qt.WindowStaysOnTopHint |
+                                 Qt.WindowDoesNotAcceptFocus)
+            self.window.setMinimumWidth(250)
+            self.window.setMinimumHeight(88)
+            self.window.resize(270, 96)
+            position = getattr(self, "compact_position", None)
+            if position is None:
+                screen = self.window.screen() or self.app.primaryScreen()
+                area = screen.availableGeometry()
+                position = QPoint(area.right() - self.window.width() - 20,
+                                  area.top() + 20)
+            self.window.setPosition(self._visible_position(position))
+            self.window.show()
+            return
+        if previous_mode == "compact":
+            self.compact_position = self.window.position()
+        if self.window.flags() != self.standard_window_flags:
+            self.window.setFlags(self.standard_window_flags)
         if mode == "widget":
             self.window.setMinimumWidth(390)
             self.window.setMinimumHeight(250)
             self.window.resize(410, 310)
+            if getattr(self, "widget_position", None) is not None:
+                self.window.setPosition(self._visible_position(self.widget_position))
         else:
             self.window.setMinimumWidth(1100 if mode == "admin" else 720)
             self.window.setMinimumHeight(650 if mode == "admin" else 560)
@@ -76,6 +108,15 @@ class QtHost:
             self.window.raise_()
         else:
             self.window.hide()
+
+    def _visible_position(self, position: QPoint) -> QPoint:
+        screen = self.app.screenAt(position) or self.window.screen() or \
+            self.app.primaryScreen()
+        area = screen.availableGeometry()
+        return QPoint(max(area.left(), min(position.x(),
+                                           area.right() - self.window.width() + 1)),
+                      max(area.top(), min(position.y(),
+                                          area.bottom() - self.window.height() + 1)))
 
 
 class Application(QtHost):
@@ -91,10 +132,13 @@ class Application(QtHost):
         self.console_transitioning = False
         self.shutting_down = False
         self.widget_user_hidden = False
+        self.widget_position = None
+        self.compact_position = None
         self._load_ui()
         self.tray = QSystemTrayIcon(self.app)
-        self.tray.setIcon(self.app.style().standardIcon(
-            QStyle.StandardPixmap.SP_ComputerIcon))
+        self.tray.setIcon(self.app.windowIcon() if not self.app.windowIcon().isNull()
+                          else self.app.style().standardIcon(
+                              QStyle.StandardPixmap.SP_ComputerIcon))
         self.tray_menu = QMenu()
         self.tray_menu.addAction("Open Game Cafe Console", self._show_window)
         self.tray.setContextMenu(self.tray_menu)
@@ -163,12 +207,35 @@ class Application(QtHost):
             self.bridge._show_notice("Tray unavailable",
                                      "This Windows session has no notification area.", True)
 
+    def show_compact_timer(self):
+        if (self.bridge.mode != "widget"
+                or not self.bridge.view.get("accessAllowed")):
+            return
+        self.widget_position = self.window.position()
+        self.widget_user_hidden = False
+        self.bridge._set_mode("compact")
+
+    def expand_widget(self):
+        if self.bridge.mode != "compact":
+            return
+        self.compact_position = self.window.position()
+        self.bridge._set_mode("widget")
+        self._show_window()
+
+    def clamp_compact_timer(self):
+        if self.bridge.mode == "compact":
+            position = self._visible_position(self.window.position())
+            self.window.setPosition(position)
+            self.compact_position = position
+
     def update_widget_access(self, allowed: bool):
-        if self.bridge.mode != "widget":
+        if self.bridge.mode not in ("widget", "compact"):
             return
         if allowed and not self.widget_user_hidden:
             self._show_window()
         elif not allowed:
+            if self.bridge.mode == "compact":
+                self.bridge._set_mode("widget")
             self.window.hide()
 
     def shutdown(self):

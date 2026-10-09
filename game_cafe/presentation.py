@@ -3,9 +3,29 @@
 from __future__ import annotations
 
 from datetime import datetime
+import re
 import time
 
 from . import sessions
+
+
+def natural_name_key(name: str) -> tuple:
+    """Case-insensitive key that keeps PC-2 before PC-10."""
+    return tuple((1, int(part)) if part.isdigit() else (0, part)
+                 for part in re.split(r"(\d+)", name.casefold()) if part)
+
+
+def sort_pc_rows(rows: list[dict], snapshot: dict,
+                 option: str) -> list[dict]:
+    """Order PC rows without changing their immutable ID-based actions."""
+    if option == "name":
+        return sorted(rows, key=lambda row: (natural_name_key(row["name"]),
+                                             row["pcId"]))
+    members = snapshot.get("members", {})
+    return sorted(rows, key=lambda row: (
+        -float(members.get(row["pcId"], {}).get("last_connected_at", 0)),
+        row["pcId"],
+    ))
 
 
 def duration(seconds: float) -> str:

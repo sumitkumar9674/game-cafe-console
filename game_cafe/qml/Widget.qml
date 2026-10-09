@@ -10,9 +10,7 @@ Item {
                     Text { text: bridge.view.cafeName || "Game Cafe Console"; color: "#f6fbff"; font.bold: true; font.pixelSize: 16 }
                     Text { text: bridge.view.ownName || "User PC"; color: "#91a9ba" }
                 }
-                Text { text: "Hide"; color: "#7892a4"; font.pixelSize: 11
-                    MouseArea { anchors.fill: parent; anchors.margins: -8; onClicked: bridge.hideWidget() }
-                }
+                ActionButton { text: "Compact Timer"; secondary: true; onClicked: bridge.compactTimer() }
             }
             Text { text: (bridge.view.phase || "WAITING") + " · " + (bridge.view.timeText || "00:00:00"); color: "#35c7c7"; font.pixelSize: 19; font.bold: true }
             Text { text: "Player: " + (bridge.view.player || "Guest"); color: "#f5fbff" }

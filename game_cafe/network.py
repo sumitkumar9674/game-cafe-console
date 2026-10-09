@@ -12,6 +12,7 @@ import time
 import uuid
 
 from .storage import Store
+from .lifecycle import lifecycle_event
 from .security import sign_node, verify_node
 
 
@@ -257,11 +258,16 @@ class NodeNetwork:
 
     def stop(self) -> None:
         self.stop_event.set()
+        lifecycle_event("network_sockets_closing")
         for sock in (self.tcp, self.udp):
             if sock:
                 sock.close()
         for thread in self.threads:
+            lifecycle_event("network_listener_join_started",
+                            worker=thread.name, worker_alive=thread.is_alive())
             thread.join(timeout=1.0)
+            lifecycle_event("network_listener_join_completed",
+                            worker=thread.name, worker_alive=thread.is_alive())
         self.tcp = self.udp = None
 
     def call(self, ip: str, operation: str, data: dict) -> dict:

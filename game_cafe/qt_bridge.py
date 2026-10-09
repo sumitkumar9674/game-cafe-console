@@ -16,6 +16,7 @@ from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QFileDialog
 
 from . import desktops, sessions
+from .lifecycle import lifecycle_event
 from .branding import app_logo_source
 from .network import discover
 from .presentation import (add_time_preview, duration, history_rows,
@@ -1027,9 +1028,12 @@ class CafeBridge(QObject):
     @Slot()
     def closeSoftware(self) -> None:
         if self.child:
+            self.host.trace_shutdown("staff_shutdown_requested")
             credential = self._require_staff()
             if credential is not None:
+                self.host.trace_shutdown("staff_authorization_confirmed")
                 self._post_child("close_software", {"password_sealed": credential})
+                self.host.trace_shutdown("staff_shutdown_command_posted")
                 self._revoke_staff()
 
     @Slot(result=bool)
@@ -1052,15 +1056,10 @@ class CafeBridge(QObject):
         if not self.child:
             self.host.open_console()
 
-    @Slot()
-    def hideWidget(self) -> None:
+    @Slot(int, int)
+    def updateWidgetSize(self, required_width: int, required_height: int) -> None:
         if not self.child:
-            self.host.hide_widget()
-
-    @Slot(int)
-    def updateWidgetHeight(self, required: int) -> None:
-        if not self.child:
-            self.host.update_widget_height(required)
+            self.host.update_widget_size(required_width, required_height)
 
     @Slot()
     def closeAdmin(self) -> None:
@@ -1114,7 +1113,7 @@ class CafeBridge(QObject):
                 elif kind == "error":
                     print(f"Game Cafe Console: {value}")
                 elif kind == "remote_exit":
-                    self.host.shutdown()
+                    self.host.shutdown(source="remote_exit")
             if self._mode == "admin" and not self.runtime.is_admin():
                 self._enter_user()
         except Exception as error:
@@ -1157,7 +1156,8 @@ class CafeBridge(QObject):
                     self.store.set_local("customer_feedback", f"Close failed: {error}")
                     self._show_notice("Cannot close software", str(error), True)
                 else:
-                    self.host.shutdown()
+                    self.host.trace_shutdown("staff_command_verified")
+                    self.host.shutdown(source="staff_access")
             self._submit("close_software", work, done, blocking=True)
         elif action in ("staff_start", "staff_add"):
             def work():
@@ -1184,6 +1184,8 @@ class CafeBridge(QObject):
             self._submit(action, work, done, blocking=True)
 
     def shutdown(self) -> None:
+        lifecycle_event("qt_bridge_shutdown_started", child=self.child,
+                        pending_jobs=len(self._jobs))
         self._shutting_down = True
         self._revoke_staff()
         self.tick_timer.stop()
@@ -1191,3 +1193,4 @@ class CafeBridge(QObject):
         self.join_timer.stop()
         # Finish in-flight workers before the host closes the shared SQLite store.
         self._executor.shutdown(wait=True, cancel_futures=True)
+        lifecycle_event("qt_bridge_shutdown_completed", child=self.child)

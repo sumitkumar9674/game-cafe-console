@@ -10,8 +10,9 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
-from PySide6.QtCore import QMetaObject, QObject
+from PySide6.QtCore import QMetaObject, QObject, Qt
 from PySide6.QtQml import QQmlApplicationEngine
+from PySide6.QtTest import QTest
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import QApplication
 
@@ -57,30 +58,70 @@ class WidgetLifecycleTest(unittest.TestCase):
         self.store_patch.stop()
         self.temp.cleanup()
 
-    def test_hide_reopen_and_refresh_do_not_change_widget_mode(self):
+    def test_widget_uses_taskbar_minimize_without_tray_or_session_change(self):
         self.assertEqual(self.host.bridge.mode, "widget")
-        with patch.object(self.host, "_show_window", wraps=self.host._show_window) as show:
-            self.host.update_widget_access(True)
-            self.host.update_widget_access(True)
-            show.assert_not_called()
-        if self.host.tray.isVisible():
-            self.host.hide_widget()
-            self.assertFalse(self.host.window.isVisible())
-            self.host.update_widget_access(True)
-            self.assertFalse(self.host.window.isVisible())
-            self.host._show_window()
-            self.assertTrue(self.host.window.isVisible())
-        self.host.update_widget_access(False)
+        self.assertFalse(hasattr(self.host, "tray"))
+        self.assertTrue(self.host.window.flags() & Qt.WindowMinimizeButtonHint)
+        self.host.window.showMinimized()
         self.app.processEvents()
+        self.assertTrue(self.host.window.windowState() & Qt.WindowMinimized)
+        self.assertTrue(self.host.window.isVisible())
+        self.host.update_widget_access(True)
+        self.app.processEvents()
+        self.assertTrue(self.host.window.windowState() & Qt.WindowMinimized)
         self.assertEqual(self.host.bridge.mode, "widget")
-        self.assertFalse(self.host.window.isVisible())
+        self.assertTrue(self.host.bridge.view["hasSession"])
+        self.runtime.prepare_local_shutdown.assert_not_called()
+        self.host.window.showNormal()
+        self.app.processEvents()
+        self.assertTrue(self.host.window.isVisible())
+        self.assertFalse(self.host.window.windowState() & Qt.WindowMinimized)
 
-    def test_widget_has_content_based_height_and_scroll_fallback(self):
+    def test_widget_has_content_safe_default_and_minimum_size(self):
         loader = self.host.window.findChild(QObject, "mainLoader")
         content = loader.property("item")
+        area = self.host.app.primaryScreen().availableGeometry()
+        self.assertEqual(int(content.property("implicitWidth")), 480)
+        self.assertGreaterEqual(self.host.window.width(), 480)
+        self.assertGreaterEqual(self.host.window.height(), 400)
+        self.assertEqual(self.host.window.minimumWidth(),
+                         min(480, area.width() - 40))
         self.assertGreaterEqual(self.host.window.minimumHeight(),
                                 min(int(content.property("implicitHeight")),
-                                    self.host.app.primaryScreen().availableGeometry().height() - 40))
+                                    area.height() - 40))
+        for name in ("widgetPlayerName", "widgetUpdateButton",
+                     "widgetOpenConsoleButton", "widgetFooter"):
+            control = self.host.window.findChild(QObject, name)
+            self.assertIsNotNone(control)
+            self.assertTrue(control.property("visible"))
+        maximum = self.host._widget_dimensions(5000, 5000)
+        self.assertLessEqual(maximum[0], area.width() - 40)
+        self.assertLessEqual(maximum[1], area.height() - 40)
+
+    def test_widget_qml_has_no_hide_or_compact_control(self):
+        source = (Path(__file__).resolve().parents[1] / "game_cafe" / "qml" /
+                  "Widget.qml").read_text(encoding="utf-8")
+        self.assertNotIn('text: "Hide"', source)
+        self.assertNotIn("hideWidget", source)
+        self.assertNotIn("Compact", source)
+        self.assertFalse(hasattr(self.host.bridge, "hideWidget"))
+
+    def test_long_connection_message_wraps_without_horizontal_overflow(self):
+        message = "Admin connection unavailable; session tracking continues locally. " * 5
+        self.host.bridge._set_view(connectionNote=message)
+        QTest.qWait(100)
+        connection = self.host.window.findChild(QObject, "widgetConnectionMessage")
+        self.assertEqual(connection.property("text"), message)
+        self.assertGreater(connection.height(), 20)
+        self.assertLessEqual(connection.width(), self.host.window.width() - 40)
+
+    def test_widget_x_minimizes_instead_of_closing(self):
+        self.host.window.close()
+        self.app.processEvents()
+        self.assertTrue(self.host.window.isVisible())
+        self.assertTrue(self.host.window.windowState() & Qt.WindowMinimized)
+        self.assertFalse(self.host.shutting_down)
+        self.runtime.prepare_local_shutdown.assert_not_called()
 
 
 class StaffAccessTest(unittest.TestCase):

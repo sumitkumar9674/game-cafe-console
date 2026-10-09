@@ -52,7 +52,7 @@ class AdminCloseTest(unittest.TestCase):
         self.temp.cleanup()
 
     def test_x_opens_confirmation_and_cancel_keeps_window(self):
-        self.assertFalse(self.host.tray.isVisible())
+        self.assertFalse(hasattr(self.host, "tray"))
         self.host.window.close()
         self.app.processEvents()
         self.assertTrue(self.host.window.isVisible())
@@ -68,7 +68,7 @@ class AdminCloseTest(unittest.TestCase):
         self.assertTrue(self.host.window.isVisible())
         self.assertFalse(self.host.shutting_down)
 
-    def test_confirm_runs_full_cleanup_without_tray_interception(self):
+    def test_confirm_runs_full_cleanup_without_background_window_lifecycle(self):
         with patch.object(self.host, "stop_console") as stop_console:
             self.host.window.close()
             self.app.processEvents()
@@ -80,14 +80,13 @@ class AdminCloseTest(unittest.TestCase):
                 time.sleep(0.01)
             stop_console.assert_called_once()
         self.assertTrue(self.host.shutting_down)
-        self.assertFalse(self.host.tray.isVisible())
         self.host._cleanup()
         self.cleaned = True
         self.runtime.prepare_local_shutdown.assert_called_once()
         self.runtime.release_admin.assert_called_once()
         self.runtime.stop.assert_called_once()
         self.runtime.flush_owner_record.assert_not_called()
-        self.assertFalse(self.host.tray.isVisible())
+        self.assertFalse(hasattr(self.host, "tray"))
         self.assertFalse(self.host.bridge.tick_timer.isActive())
         self.assertFalse(self.host.bridge.refresh_timer.isActive())
         with self.assertRaises(sqlite3.ProgrammingError):
@@ -109,11 +108,10 @@ class AdminCloseTest(unittest.TestCase):
         self.runtime.release_admin.assert_called_once()
         self.runtime.stop.assert_called_once()
 
-    def test_admin_minimize_does_not_activate_tray_or_shutdown(self):
+    def test_admin_minimize_does_not_shutdown(self):
         self.host.window.showMinimized()
         self.app.processEvents()
         self.assertTrue(self.host.window.windowState() & Qt.WindowMinimized)
-        self.assertFalse(self.host.tray.isVisible())
         self.assertFalse(self.host.shutting_down)
         self.assertFalse(self.host.window.property("confirmation").property("title").isString())
 
@@ -131,6 +129,42 @@ class AdminCloseTest(unittest.TestCase):
             stop_console.assert_not_called()
             self.runtime.stop.assert_not_called()
             self.assertIn("disk full", self.host.bridge.notice["message"])
+
+    def test_child_stop_failure_restores_a_visible_recoverable_window(self):
+        self.host.bridge._set_view(accessAllowed=False)
+        self.host.bridge._set_mode("widget")
+        with patch.object(self.host, "stop_console",
+                          side_effect=TimeoutError("child did not stop")):
+            self.host.shutdown(source="staff_access")
+            deadline = time.monotonic() + 3
+            while self.host.shutdown_state != "failed" and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(0.01)
+            self.assertEqual(self.host.shutdown_state, "failed")
+            self.host.update_widget_access(False)
+            self.app.processEvents()
+            self.assertTrue(self.host.window.isVisible())
+            self.assertFalse(self.host.shutting_down)
+            self.runtime.stop.assert_not_called()
+            self.assertIn("child did not stop", self.host.bridge.notice["message"])
+
+    def test_shutdown_diagnostics_record_ordered_major_stages(self):
+        with patch.object(self.host, "stop_console"), \
+             patch("game_cafe.qt_app.lifecycle_event") as event:
+            self.host.shutdown(source="staff_access")
+            deadline = time.monotonic() + 3
+            while not self.host.shutting_down and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(0.01)
+        stages = [call.args[0] for call in event.call_args_list]
+        expected = [
+            "shutdown_requested", "session_finalization_started",
+            "session_finalization_completed", "session_history_persisted",
+            "network_shutdown_started",
+            "network_background_workers_stopped", "qt_quit_requested",
+        ]
+        positions = [stages.index(stage) for stage in expected]
+        self.assertEqual(positions, sorted(positions))
 
     def test_shutdown_finalization_does_not_block_qt_event_loop(self):
         release = threading.Event()

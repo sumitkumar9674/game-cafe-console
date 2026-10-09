@@ -2,7 +2,7 @@
 
 Place these files here when branded artwork is available:
 
-- `app_icon.ico` — Windows executable, title-bar, taskbar, and tray icon.
+- `app_icon.ico` — Windows executable, title-bar, and taskbar icon.
 - `app_logo.png` — logo shown on the startup and Admin-login loading screen.
 
 Both files are optional. Missing or unreadable files use the built-in Qt icon and

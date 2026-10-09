@@ -89,6 +89,8 @@ kernel32.WaitForMultipleObjects.restype = wintypes.DWORD
 kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE,
                                         ctypes.POINTER(wintypes.DWORD)]
 kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+kernel32.GetProcessId.argtypes = [wintypes.HANDLE]
+kernel32.GetProcessId.restype = wintypes.DWORD
 kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 kernel32.CloseHandle.restype = wintypes.BOOL
 kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
@@ -197,6 +199,13 @@ def exit_code(process: int) -> int:
     if not kernel32.GetExitCodeProcess(process, ctypes.byref(code)):
         raise error("GetExitCodeProcess")
     return code.value
+
+
+def process_id(process: int | None) -> int | None:
+    if not process:
+        return None
+    pid = kernel32.GetProcessId(process)
+    return int(pid) if pid else None
 
 
 def launch_child(ready_name: str, stop_name: str) -> int:

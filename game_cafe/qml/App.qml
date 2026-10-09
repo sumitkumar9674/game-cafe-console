@@ -39,7 +39,7 @@ ApplicationWindow {
             if (root.notice.title) bridge.clearNotice()
             confirmAdminExit()
         } else if (bridge.mode === "widget") {
-            bridge.hideWidget()
+            root.showMinimized()
         } else {
             bridge.closeApplication()
         }

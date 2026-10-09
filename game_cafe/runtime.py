@@ -11,6 +11,7 @@ import uuid
 
 from . import sessions
 from .desktops import active_desktop_name, switch
+from .lifecycle import lifecycle_event
 from .network import (NodeNetwork, authenticated_call, create_pairing_key,
                       discover, open_welcome, pairing_code, pairing_secret,
                       plain_call, seal_welcome)
@@ -84,9 +85,14 @@ class Runtime:
 
     def stop(self) -> None:
         self.stop_event.set()
+        lifecycle_event("network_listener_shutdown_started")
         self.network.stop()
+        lifecycle_event("network_listener_shutdown_completed")
         if self.worker:
+            lifecycle_event("runtime_background_worker_join_started",
+                            worker_alive=self.worker.is_alive())
             self.worker.join()
+            lifecycle_event("runtime_background_worker_join_completed")
             self.worker = None
 
     def release_admin(self) -> None:

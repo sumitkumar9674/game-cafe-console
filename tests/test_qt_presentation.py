@@ -37,6 +37,7 @@ class QtPresentationTest(unittest.TestCase):
         self.host.console_process = None
         self.runtime = Mock()
         self.runtime.events = queue.Queue()
+        self.runtime.confirmed_remote_admin_online.return_value = False
         self.bridge = CafeBridge(self.store, self.host, self.runtime)
 
     def tearDown(self):
@@ -425,7 +426,89 @@ class QtPresentationTest(unittest.TestCase):
         self.bridge.begin()
         self.wait_for_idle()
         self.assertEqual(self.bridge.mode, "candidate")
+        self.assertFalse(self.bridge.view["activeAdminDetected"])
         self.assertEqual(self.bridge.view["cafeName"], "Cafe")
+
+    def test_saved_pool_with_live_admin_stays_on_login_as_user_choice(self):
+        snapshot, secret = new_pool("Cafe", self.store.pc_id, "PC-01", "Admin",
+                                    "long test password", self.store.node_public_key())
+        self.store.save_pool(snapshot, secret, join=True)
+        self.runtime.verified_admin_online.return_value = True
+        self.runtime.confirmed_remote_admin_online.return_value = True
+        self.bridge.begin()
+        self.wait_for_idle()
+        self.assertEqual(self.bridge.mode, "candidate")
+        self.assertTrue(self.bridge.view["activeAdminDetected"])
+        self.host.start_console.assert_not_called()
+        self.host.stop_console.assert_not_called()
+
+    def test_login_selects_user_and_disables_admin_when_admin_appears(self):
+        self.bridge._set_mode("candidate")
+        engine = QQmlApplicationEngine()
+        engine.rootContext().setContextProperty("bridge", self.bridge)
+        qml = Path(__file__).resolve().parents[1] / "game_cafe" / "qml" / "App.qml"
+        engine.load(QUrl.fromLocalFile(str(qml)))
+        root = engine.rootObjects()[0]
+        admin_option = root.findChild(QObject, "adminRoleOption")
+        continue_button = root.findChild(QObject, "continueAsUserButton")
+        heading = root.findChild(QObject, "loginRoleHeading")
+        message = root.findChild(QObject, "activeAdminMessage")
+        self.assertTrue(admin_option.property("enabled"))
+        self.assertFalse(continue_button.property("visible"))
+
+        self.bridge._set_view(activeAdminDetected=True)
+        self.app.processEvents()
+        self.assertFalse(admin_option.property("enabled"))
+        self.assertTrue(continue_button.property("visible"))
+        self.assertEqual(heading.property("text"), "Continue as User")
+        self.assertTrue(message.property("visible"))
+        self.host.start_console.assert_not_called()
+
+        self.bridge._set_view(activeAdminDetected=False)
+        self.app.processEvents()
+        self.assertTrue(admin_option.property("enabled"))
+        self.assertTrue(continue_button.property("visible"))
+        self.assertEqual(heading.property("text"), "Continue as User")
+        self.host.start_console.assert_not_called()
+
+    def test_login_admin_check_reuses_refresh_and_stops_outside_login(self):
+        snapshot, secret = new_pool("Cafe", self.store.pc_id, "PC-01", "Admin",
+                                    "long test password", self.store.node_public_key())
+        self.store.save_pool(snapshot, secret, join=True)
+        self.runtime.status.return_value = {"desktop": "Default"}
+        self.runtime.is_admin.return_value = False
+        self.runtime.confirmed_remote_admin_online.return_value = True
+        self.bridge._set_mode("candidate")
+        self.assertTrue(self.bridge._collect_state("", True)["activeAdminDetected"])
+        self.runtime.confirmed_remote_admin_online.assert_called_once_with()
+
+        for mode in ("widget", "admin"):
+            with self.subTest(mode=mode):
+                self.runtime.confirmed_remote_admin_online.reset_mock()
+                self.bridge._set_mode(mode)
+                self.assertFalse(
+                    self.bridge._collect_state("", True)["activeAdminDetected"])
+                self.runtime.confirmed_remote_admin_online.assert_not_called()
+
+    def test_detected_admin_still_requires_continue_as_user_confirmation(self):
+        snapshot, secret = new_pool("Cafe", self.store.pc_id, "PC-01", "Admin",
+                                    "long test password", self.store.node_public_key())
+        self.store.save_pool(snapshot, secret, join=True)
+        self.bridge.refresh_timer.stop()
+        self.bridge._set_view(activeAdminDetected=True)
+        self.bridge._set_mode("candidate")
+        engine = QQmlApplicationEngine()
+        engine.rootContext().setContextProperty("bridge", self.bridge)
+        qml = Path(__file__).resolve().parents[1] / "game_cafe" / "qml" / "App.qml"
+        engine.load(QUrl.fromLocalFile(str(qml)))
+        root = engine.rootObjects()[0]
+        continue_button = root.findChild(QObject, "continueAsUserButton")
+        self.assertTrue(continue_button.property("visible"))
+        self.host.start_console.assert_not_called()
+        continue_button.clicked.emit()
+        self.wait_for_idle()
+        self.assertEqual(self.bridge.mode, "widget")
+        self.host.start_console.assert_called_once_with()
 
     def test_invalid_session_action_never_reaches_runtime(self):
         self.bridge.pc_model.update_rows([{"pcId": "admin", "start": False,

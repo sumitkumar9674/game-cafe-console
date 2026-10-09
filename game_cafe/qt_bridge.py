@@ -92,7 +92,8 @@ class CafeBridge(QObject):
                             "brand": DEVELOPER_BRAND, "website": DEVELOPER_WEBSITE,
                             "email": DEVELOPER_EMAIL,
                             "appLogoSource": app_logo_source(),
-                            "adminLoginFailed": False}
+                            "adminLoginFailed": False,
+                            "activeAdminDetected": False}
         self._status = "Starting Game Cafe Console"
         self._notice: dict = {}
         self._busy = False
@@ -289,21 +290,25 @@ class CafeBridge(QObject):
                 self._runtime_started = True
             if self.store.current_pool_id:
                 live = self.runtime.verified_admin_online()
-                return "user" if live else "candidate", [], self._branding(self.store.snapshot())
-            return "onboarding", discover(timeout=1.5), {}
+                return "candidate", [], self._branding(self.store.snapshot()), live
+            return "onboarding", discover(timeout=1.5), {}, False
         def done(result, error):
             if error:
                 self._set_status("Connection failed")
                 self._show_notice("Could not start", str(error), True)
                 self._set_mode("splash")
                 return
-            mode, found, branding = result
-            self._set_view(pools=self._distinct_pools(found), **branding)
-            if mode == "user":
-                self._enter_user()
+            mode, found, branding, active_admin = result
+            self._set_view(pools=self._distinct_pools(found),
+                           activeAdminDetected=active_admin, **branding)
+            if mode == "candidate":
+                self._set_status("Admin connected - continue as User"
+                                 if active_admin else
+                                 "Choose Admin or User access")
+                self._set_mode(mode)
+                self.refresh()
             else:
-                self._set_status("Determining Admin/User role" if mode == "candidate"
-                                 else "Choose a café or create a new one")
+                self._set_status("Choose a café or create a new one")
                 self._set_mode(mode)
                 self.refresh()
         self._set_status("Connecting to café" if self.store.current_pool_id
@@ -523,6 +528,10 @@ class CafeBridge(QObject):
         feedback = self.store.local("customer_feedback") or ""
         pending = self.store.pending_joins() if self.runtime and self.runtime.is_admin() else []
         peers = {item["pc_id"]: item for item in self.store.peers()} if self.runtime else {}
+        active_admin = bool(
+            self.runtime and self._mode == "candidate"
+            and self.runtime.confirmed_remote_admin_online()
+        )
         return {
             "snapshot": snap, "rows": rows,
             "history": history_rows(snap, None if all_history else selected),
@@ -553,6 +562,7 @@ class CafeBridge(QObject):
             "hasSession": bool(session),
             "accessAllowed": phase in ("buffer", "timed", "open", "paused"),
             "canSwitchAdmin": session is None,
+            "activeAdminDetected": active_admin,
             "feedback": feedback,
             "connectionNote": self.store.local("admin_connection_note") or "",
             "hasAvatar": bool(snap.get("logo")),
@@ -609,6 +619,11 @@ class CafeBridge(QObject):
                 result["requestCooldown"] = max(0, int(self._cooldown_until - time.time()))
             result.pop("session")
             self._set_view(**result)
+            if self._mode == "candidate":
+                self._set_status(
+                    "Admin connected - continue as User"
+                    if result["activeAdminDetected"] else
+                    "Choose Admin or User access")
             if self._mode == "widget":
                 self.host.update_widget_access(bool(result["accessAllowed"]))
         self._submit("refresh", lambda: self._collect_state(selected, all_history), done)

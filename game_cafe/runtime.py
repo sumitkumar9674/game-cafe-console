@@ -285,6 +285,23 @@ class Runtime:
         """Find a live Admin without depending on the last saved owner."""
         return self._find_live_admin() is not None
 
+    def confirmed_remote_admin_online(self) -> bool:
+        """Use the verified claim and cached heartbeat for login-screen state."""
+        snap = self.snapshot()
+        if not snap:
+            return False
+        claim = snap["active_admin"]
+        admin_id = claim.get("pc_id")
+        if (not admin_id or admin_id == self.store.pc_id
+                or admin_id not in snap["members"]
+                or claim.get("expires_at", 0) <= time.time()):
+            return False
+        status = self.peer_status(admin_id)
+        return bool(status and status.get("admin")
+                    and status.get("pc_id") == admin_id
+                    and int(status.get("admin_term", -1))
+                    == int(claim.get("term", 0)))
+
     def _find_live_admin(self) -> tuple[str, str] | None:
         if not self.snapshot():
             return None

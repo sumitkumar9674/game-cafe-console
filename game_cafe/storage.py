@@ -142,6 +142,7 @@ class Store:
             ("pairing_public", "TEXT"), ("pairing_admin_public", "TEXT"),
             ("pairing_secret", "TEXT"), ("expires_at", "REAL"),
             ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+            ("verification_digest", "TEXT"), ("cancel_digest", "TEXT"),
         ):
             if column not in join_columns:
                 self.db.execute(f"ALTER TABLE pending_joins ADD COLUMN {column} {definition}")
@@ -574,7 +575,9 @@ class Store:
             )
 
     def record_join(self, request_id: str, pc_id: str, name: str,
-                    ip: str, public_key: str, pairing_public: str) -> None:
+                    ip: str, public_key: str, pairing_public: str,
+                    pairing_admin_public: str, pairing_secret: str,
+                    verification_digest: str, cancel_digest: str) -> None:
         with self._lock, self.db:
             now = time.time()
             self.db.execute(
@@ -585,9 +588,11 @@ class Store:
             self.db.execute(
                 "INSERT OR IGNORE INTO pending_joins"
                 "(request_id,pc_id,proposed_name,ip,public_key,created_at,"
-                "pairing_public,expires_at) VALUES(?,?,?,?,?,?,?,?)",
+                "pairing_public,pairing_admin_public,pairing_secret,expires_at,"
+                "verification_digest,cancel_digest) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (request_id, pc_id, name, ip, public_key, now,
-                 pairing_public, now + 300)
+                 pairing_public, pairing_admin_public, pairing_secret, now + 300,
+                 verification_digest, cancel_digest)
             )
 
     def pending_joins(self) -> list[dict]:
@@ -605,39 +610,28 @@ class Store:
                               "pairing_secret", "expires_at", "attempts"), row))
                     for row in rows]
 
-    def set_join_pairing(self, request_id: str, admin_public: str,
-                         shared_hex: str) -> tuple[str, str]:
-        with self._lock, self.db:
-            row = self.db.execute(
-                "SELECT decision,expires_at,pairing_admin_public,pairing_secret "
-                "FROM pending_joins WHERE request_id=?", (request_id,)
-            ).fetchone()
-            if not row or row[0] != "pending" or row[1] <= time.time():
-                raise RuntimeError("Join request expired; generate a new code.")
-            if row[2] and row[3]:
-                return row[2], row[3]
-            self.db.execute(
-                "UPDATE pending_joins SET pairing_admin_public=?,pairing_secret=? "
-                "WHERE request_id=?", (admin_public, shared_hex, request_id)
-            )
-            return admin_public, shared_hex
-
     def verify_join_code(self, request_id: str, pc_id: str,
-                         entered: str, expected: str) -> str:
+                         entered: str) -> str:
         error = None
         with self._lock, self.db:
             row = self.db.execute(
-                "SELECT decision,expires_at,attempts,pairing_secret "
+                "SELECT decision,expires_at,attempts,pairing_secret,"
+                "verification_digest "
                 "FROM pending_joins WHERE request_id=? AND pc_id=?",
                 (request_id, pc_id)
             ).fetchone()
             if not row or row[0] != "pending" or row[1] <= time.time():
                 raise RuntimeError("Join request expired; generate a new code.")
-            if not row[3]:
-                raise RuntimeError("Pairing has not started.")
+            if not row[3] or not row[4]:
+                raise RuntimeError("Pairing request is incomplete.")
             if row[2] >= 5:
                 raise PermissionError("Too many incorrect codes; request a new code.")
-            if not hmac.compare_digest(entered, expected):
+            entered_digest = hmac.new(
+                bytes.fromhex(row[3]),
+                f"verify:{request_id}:{entered}".encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            if not hmac.compare_digest(entered_digest, row[4]):
                 attempts = row[2] + 1
                 self.db.execute(
                     "UPDATE pending_joins SET attempts=?,decision=? WHERE request_id=?",
@@ -652,6 +646,30 @@ class Store:
         if error:
             raise PermissionError(error)
         return row[3]
+
+    def cancel_join(self, request_id: str, pc_id: str,
+                    cancel_token: str) -> bool:
+        """Cancel only the request carrying its high-entropy requester token."""
+        with self._lock, self.db:
+            row = self.db.execute(
+                "SELECT decision,expires_at,pairing_secret,cancel_digest "
+                "FROM pending_joins WHERE request_id=? AND pc_id=?",
+                (request_id, pc_id),
+            ).fetchone()
+            if not row or row[0] != "pending" or row[1] <= time.time():
+                return False
+            digest = hmac.new(
+                bytes.fromhex(row[2]),
+                f"cancel:{request_id}:{cancel_token}".encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            if not hmac.compare_digest(digest, row[3] or ""):
+                raise PermissionError("Invalid pairing cancellation.")
+            self.db.execute(
+                "UPDATE pending_joins SET decision='cancelled' WHERE request_id=?",
+                (request_id,),
+            )
+            return True
 
     def decide_join(self, request_id: str, decision: str,
                     sealed_welcome: str | None = None) -> None:

@@ -22,7 +22,6 @@ COMMAND_PORT = 48121
 MAX_MESSAGE = 1_000_000
 TIMEOUT = 2.5
 REPLAY_WINDOW = 30
-PAIRING_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 
 def compact(data: dict) -> bytes:
@@ -132,12 +131,6 @@ def _pairing_bytes(shared: bytes, request_id: str, purpose: bytes,
         raise ValueError("Invalid pairing secret or request ID.")
     return HKDF(algorithm=hashes.SHA256(), length=length, salt=request,
                 info=b"GameCafeConsole pairing v2 " + purpose).derive(shared)
-
-
-def pairing_code(shared: bytes, request_id: str) -> str:
-    """Seven-character comparison code from fresh cryptographic key material."""
-    raw = _pairing_bytes(shared, request_id, b"verification", 7)
-    return "".join(PAIRING_ALPHABET[value & 31] for value in raw)
 
 
 def seal_welcome(shared: bytes, request_id: str, welcome: dict) -> str:
@@ -322,7 +315,7 @@ class NodeNetwork:
                 operation = request.get("operation")
                 if request.get("protocol") != PROTOCOL:
                     raise ValueError("Unsupported protocol.")
-                if operation in ("join_request", "join_poll"):
+                if operation in ("join_request", "join_poll", "join_cancel"):
                     result = self.runtime.handle_plain(operation, request.get("data", {}), ip)
                     send_message(connection, {"ok": True, "data": result})
                     return

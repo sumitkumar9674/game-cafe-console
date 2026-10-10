@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib
+import hmac
 import json
 import queue
+import re
+import secrets
 import threading
 import time
 import uuid
@@ -15,7 +19,7 @@ from . import sessions
 from .desktops import active_desktop_name, switch
 from .lifecycle import lifecycle_event
 from .network import (NodeNetwork, authenticated_call, create_pairing_key,
-                      discover, open_welcome, pairing_code, pairing_secret,
+                      discover, open_welcome, pairing_secret,
                       plain_call, seal_welcome)
 from .presentation import validate_add, validate_start
 from .security import (create_admin_signing_record, sign_admin_proof,
@@ -193,6 +197,8 @@ class Runtime:
     def prepare_local_shutdown(self) -> bool:
         """Durably finalize only this PC before any desktop or process teardown."""
         with self.lock:
+            if not self.store.current_pool_id:
+                return False
             if self.local_shutdown_pending:
                 return False
             self.local_shutdown_pending = True
@@ -932,34 +938,47 @@ class Runtime:
             name = str(data.get("name", ""))[:40]
             public_key = str(data.get("public_key", ""))
             pairing_public = str(data.get("pairing_public", ""))
+            verification_code = str(data.get("verification_code", ""))
+            cancel_token = str(data.get("cancel_token", ""))
             if (len(request_id) != 32 or len(pc_id) != 32
                     or len(public_key) != 64 or len(pairing_public) != 64
+                    or not re.fullmatch(r"\d{6}", verification_code)
+                    or not re.fullmatch(r"[0-9a-f]{64}", cancel_token)
                     or not name.strip()):
                 raise ValueError("Invalid join request.")
             bytes.fromhex(public_key)
             bytes.fromhex(pairing_public)
+            private, admin_public = create_pairing_key()
+            shared = pairing_secret(private, pairing_public)
+            verification_digest = hmac.new(
+                shared,
+                f"verify:{request_id}:{verification_code}".encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            cancel_digest = hmac.new(
+                shared,
+                f"cancel:{request_id}:{cancel_token}".encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
             self.store.record_join(request_id, pc_id, name, ip, public_key,
-                                   pairing_public)
+                                   pairing_public, admin_public, shared.hex(),
+                                   verification_digest, cancel_digest)
             self.notify("join_request")
-            return {"state": "pending"}
+            return {"state": "pending", "pairing_admin_public": admin_public}
         if operation == "join_poll":
             request_id = str(data.get("request_id", ""))
             decision = self.store.join_decision(request_id)
             if not decision:
                 raise ValueError("Unknown join request.")
             return decision
+        if operation == "join_cancel":
+            cancelled = self.store.cancel_join(
+                str(data.get("request_id", "")),
+                str(data.get("pc_id", "")),
+                str(data.get("cancel_token", "")),
+            )
+            return {"state": "cancelled" if cancelled else "inactive"}
         raise ValueError("Unsupported public request.")
-
-    def prepare_join_pairing(self, request_id: str) -> None:
-        """Publish an ephemeral public key so the joining PC can show its code."""
-        self._require_admin()
-        pending = next((item for item in self.store.pending_joins()
-                        if item["request_id"] == request_id), None)
-        if not pending:
-            raise ValueError("Join request expired or is no longer pending.")
-        private, admin_public = create_pairing_key()
-        shared = pairing_secret(private, pending["pairing_public"])
-        self.store.set_join_pairing(request_id, admin_public, shared.hex())
 
     def approve_join(self, request_id: str, pc_id: str,
                      verification_code: str, name: str) -> None:
@@ -968,12 +987,8 @@ class Runtime:
                         if item["request_id"] == request_id and item["pc_id"] == pc_id), None)
         if not pending:
             raise ValueError("Join request is no longer pending.")
-        if not pending["pairing_secret"]:
-            raise RuntimeError("Pairing has not started; choose Accept again.")
-        shared = bytes.fromhex(pending["pairing_secret"])
-        expected = pairing_code(shared, request_id)
         shared = bytes.fromhex(self.store.verify_join_code(
-            request_id, pc_id, verification_code.strip().upper(), expected
+            request_id, pc_id, verification_code.strip()
         ))
         name = name.strip()
         if not name or len(name) > 40:
@@ -1070,28 +1085,44 @@ class Runtime:
             return {"revision": self.snapshot()["revision"]}
         raise ValueError("Unsupported member request.")
 
-    def request_join(self, ip: str, pool_id: str, requested_name: str):
-        """Send a join request and retain the private half only on this PC."""
+    def prepare_join_request(self, pool_id: str, requested_name: str) -> dict:
+        """Create the visible code locally before any network round trip."""
         private, public = create_pairing_key()
         request_id = uuid.uuid4().hex
-        plain_call(ip, "join_request", {"pool_id": pool_id,
-                                        "pc_id": self.store.pc_id,
-                                        "request_id": request_id,
-                                        "name": requested_name,
-                                        "public_key": self.store.node_public_key(),
-                                        "pairing_public": public})
-        return request_id, private
+        code = f"{secrets.randbelow(1_000_000):06d}"
+        cancel_token = secrets.token_hex(32)
+        return {
+            "request_id": request_id, "private": private, "code": code,
+            "cancel_token": cancel_token,
+            "payload": {"pool_id": pool_id, "pc_id": self.store.pc_id,
+                        "request_id": request_id, "name": requested_name,
+                        "public_key": self.store.node_public_key(),
+                        "pairing_public": public,
+                        "verification_code": code,
+                        "cancel_token": cancel_token},
+        }
+
+    def send_join_request(self, ip: str, request: dict) -> None:
+        reply = plain_call(ip, "join_request", request["payload"])
+        request["admin_public"] = reply["pairing_admin_public"]
+
+    def request_join(self, ip: str, pool_id: str, requested_name: str):
+        request = self.prepare_join_request(pool_id, requested_name)
+        self.send_join_request(ip, request)
+        return request
+
+    def cancel_join(self, ip: str, request_id: str, cancel_token: str) -> None:
+        plain_call(ip, "join_cancel", {
+            "request_id": request_id, "pc_id": self.store.pc_id,
+            "cancel_token": cancel_token,
+        })
 
     def finish_join(self, ip: str, request_id: str, pairing_private,
                     old_pool_id: str | None = None) -> tuple[str, str | None]:
         reply = plain_call(ip, "join_poll", {"request_id": request_id})
         if reply["state"] == "pending":
-            public = reply.get("pairing_admin_public")
-            if public:
-                shared = pairing_secret(pairing_private, public)
-                return "verify", pairing_code(shared, request_id)
             return "pending", None
-        if reply["state"] in ("rejected", "expired"):
+        if reply["state"] in ("rejected", "expired", "cancelled"):
             return reply["state"], None
         shared = pairing_secret(pairing_private, reply["pairing_admin_public"])
         welcome = open_welcome(shared, request_id, reply["sealed_welcome"])

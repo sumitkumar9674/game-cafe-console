@@ -250,6 +250,7 @@ class Application(QtHost):
         self.shutdown_state = "finalizing"
 
         def work():
+            self.bridge.cancel_pending_join_for_shutdown()
             if finalize_local_session:
                 self.trace_shutdown("session_finalization_started")
                 had_session = self.runtime.prepare_local_shutdown()

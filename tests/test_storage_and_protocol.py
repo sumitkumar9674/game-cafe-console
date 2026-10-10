@@ -9,8 +9,8 @@ import sqlite3
 import unittest
 from unittest.mock import patch
 
-from game_cafe.network import (PAIRING_ALPHABET, create_pairing_key,
-                               open_welcome, pairing_code, pairing_secret,
+from game_cafe.network import (create_pairing_key,
+                               open_welcome, pairing_secret,
                                seal_welcome, signed, verify_signed)
 from game_cafe.storage import Store, new_pool, verify_password
 from game_cafe.security import (create_admin_signing_record,
@@ -92,7 +92,8 @@ class StorageAndProtocolTest(unittest.TestCase):
                     "PRAGMA table_info(pending_joins)"
                 )}
                 self.assertTrue({"pairing_public", "pairing_secret", "expires_at",
-                                 "attempts"} <= columns)
+                                 "attempts", "verification_digest",
+                                 "cancel_digest"} <= columns)
                 self.assertEqual(store.db.execute(
                     "SELECT proposed_name FROM pending_joins WHERE request_id='old'"
                 ).fetchone()[0], "Old PC")
@@ -155,10 +156,6 @@ class StorageAndProtocolTest(unittest.TestCase):
         shared = pairing_secret(applicant_private, admin_public)
         self.assertEqual(shared, pairing_secret(admin_private, applicant_public))
         request_id = secrets.token_hex(16)
-        code = pairing_code(shared, request_id)
-        self.assertEqual(len(code), 7)
-        self.assertTrue(set(code) <= set(PAIRING_ALPHABET))
-        self.assertFalse(set(code) & set("O0I1"))
         welcome = {"pool_id": "pool-1", "secret": secrets.token_hex(32)}
         sealed = seal_welcome(shared, request_id, welcome)
         self.assertEqual(open_welcome(shared, request_id, sealed), welcome)

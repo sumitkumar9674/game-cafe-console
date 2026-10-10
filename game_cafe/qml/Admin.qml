@@ -37,7 +37,7 @@ Item {
                 }
                 Text { objectName: "adminCafeName"; text: bridge.view.cafeName || "Cafe"; color: "#A8B8CA"; font.pixelSize: 13; elide: Text.ElideRight; Layout.fillWidth: true }
                 Repeater {
-                    model: ["Dashboard", "Computers", "Connections", "History", "Settings", "About"]
+                    model: ["Dashboard", "Computers", "Connections", "History", "Settings"]
                     delegate: ActionButton {
                         text: modelData
                         secondary: page.section !== modelData
@@ -45,6 +45,9 @@ Item {
                         onClicked: page.section = modelData
                     }
                 }
+                Rectangle { Layout.fillWidth: true; implicitHeight: 1; color: "#35475D" }
+                ActionButton { objectName: "adminSignOutButton"; text: "Sign Out"; secondary: true; Layout.fillWidth: true; onClicked: root.confirmAdminSignOut() }
+                ActionButton { text: "About"; secondary: page.section !== "About"; Layout.fillWidth: true; onClicked: page.section = "About" }
                 Item { Layout.fillHeight: true }
                 Text { text: (bridge.view.onlineCount || 0) + " / " + (bridge.view.totalCount || 0) + " PCs online"; color: "#A8B8CA" }
                 Text { text: "LOCAL NETWORK"; color: "#64BCC1"; font.bold: true; font.pixelSize: 11 }
@@ -266,17 +269,15 @@ Item {
                                 Text { text: rowData.name; color: "#F4F7FB"; font.bold: true }
                                 Text { text: rowData.ip + " · " + rowData.pcId; color: "#A8B8CA"; font.pixelSize: 11 }
                             }
-                            TextField { id: code; placeholderText: "7-character code"; Layout.preferredWidth: 125; maximumLength: 7 }
+                            TextField { id: code; objectName: "pairingCodeInput"; placeholderText: "6-digit code"; Layout.preferredWidth: 125; maximumLength: 6; inputMethodHints: Qt.ImhDigitsOnly }
                             TextField { id: approvedName; text: rowData.name; Layout.preferredWidth: 145 }
-                            ActionButton { text: "Pair"; onClicked: bridge.preparePairing(rowData.requestId) }
-                            ActionButton { text: "Approve"; onClicked: {
+                            ActionButton { objectName: "verifyAndConnectButton"; text: "Verify & Connect"; onClicked: {
                                 let requestId = rowData.requestId
                                 let pcId = rowData.pcId
                                 let enteredCode = code.text
                                 let name = approvedName.text
-                                root.ask("Approve computer", "Approve " + name + " using the code verified on that PC?", "Approve", function(){bridge.approvePairing(requestId,pcId,enteredCode,name)})
+                                root.ask("Connect computer", "Verify the code supplied by " + name + " and connect this PC?", "Verify & Connect", function(){bridge.approvePairing(requestId,pcId,enteredCode,name)})
                             } }
-                            ActionButton { text: "Reject"; danger: true; onClicked: bridge.rejectPairing(rowData.requestId) }
                         }
                     }
                 }
@@ -432,7 +433,6 @@ Item {
                         }
                     }
                 }
-                ActionButton { objectName: "adminSignOutButton"; text: "Sign out of Admin"; secondary: true; onClicked: bridge.signOutAdmin() }
                 ActionButton { text: "Close software"; danger: true; onClicked: root.confirmAdminExit() }
             }
         }

@@ -5,12 +5,12 @@ import QtQuick.Layouts
 Item {
     id: page
     property string tab: bridge.mode === "candidate"
-                         ? (bridge.view.activeAdminDetected ? "user" : "admin")
+                         ? (bridge.view.adminNode ? "admin" : "user")
                          : "discover"
     Connections {
         target: bridge
         function onViewChanged() {
-            if (bridge.mode === "candidate" && bridge.view.activeAdminDetected) {
+            if (bridge.mode === "candidate" && !bridge.view.adminNode) {
                 page.tab = "user"
                 password.text = ""
             }
@@ -32,7 +32,7 @@ Item {
                 ActionButton { text: "Discover"; secondary: page.tab !== "discover"; visible: bridge.mode !== "candidate"; onClicked: page.tab = "discover" }
                 ActionButton { text: "Create cafe"; secondary: page.tab !== "create"; visible: bridge.mode !== "candidate"; onClicked: page.tab = "create" }
                 ActionButton { objectName: "userRoleOption"; text: "User"; secondary: page.tab !== "user"; visible: bridge.mode === "candidate"; onClicked: page.tab = "user" }
-                ActionButton { objectName: "adminRoleOption"; text: "Admin access"; secondary: page.tab !== "admin"; visible: bridge.mode === "candidate"; enabled: !bridge.busy && !bridge.view.activeAdminDetected; onClicked: page.tab = "admin" }
+                ActionButton { objectName: "adminRoleOption"; text: "Admin access"; secondary: page.tab !== "admin"; visible: bridge.mode === "candidate"; enabled: !bridge.busy && !!bridge.view.adminNode; onClicked: page.tab = "admin" }
             }
             Panel {
                 Layout.fillWidth: true
@@ -44,7 +44,7 @@ Item {
                     spacing: 12
                     Text { objectName: "loginRoleHeading"; text: page.tab === "create" ? "Create a local cafe" : page.tab === "admin" ? "Admin login" : page.tab === "user" ? "Continue as User" : "Nearby cafes"; color: "#F4F7FB"; font.pixelSize: 20; font.bold: true }
                     Text { text: "Your cafe runs on your local network."; color: "#A8B8CA"; visible: page.tab === "create" }
-                    Text { objectName: "activeAdminMessage"; text: "An Admin is already active for this cafe. Continue as User."; color: "#A8B8CA"; visible: bridge.mode === "candidate" && bridge.view.activeAdminDetected; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                    Text { objectName: "activeAdminMessage"; text: bridge.view.adminNode ? "This PC is the designated Admin Node." : (bridge.view.adminPcName || "Admin PC") + " is " + (bridge.view.adminOnline ? "online" : "offline") + ". Admin access is available only on the designated Admin Node."; color: bridge.view.adminOnline ? "#64BCC1" : "#F2A65A"; visible: bridge.mode === "candidate"; wrapMode: Text.WordWrap; Layout.fillWidth: true }
                     TextField { id: cafe; placeholderText: "Cafe name"; Layout.fillWidth: true; visible: page.tab === "create" }
                     TextField { id: pc; placeholderText: "This PC name"; Layout.fillWidth: true; visible: page.tab === "create" }
                     TextField { id: admin; placeholderText: "Admin name"; Layout.fillWidth: true; visible: page.tab === "create" }
@@ -54,11 +54,11 @@ Item {
                         placeholderText: "Admin password"
                         Layout.fillWidth: true
                         visible: page.tab === "create" || page.tab === "admin"
-                        onAccepted: if (page.tab === "admin" && !bridge.view.activeAdminDetected) bridge.claimAdmin(text)
+                        onAccepted: if (page.tab === "admin" && bridge.view.adminNode) bridge.claimAdmin(text)
                     }
                     TextField { id: confirmation; placeholderText: "Confirm password"; echoMode: TextInput.Password; Layout.fillWidth: true; visible: page.tab === "create" }
                     ActionButton { text: "Create and open Admin Dashboard"; visible: page.tab === "create"; onClicked: bridge.createCafe(cafe.text, pc.text, admin.text, password.text, confirmation.text) }
-                    ActionButton { objectName: "adminLoginButton"; text: bridge.view.adminLoginFailed ? "Retry Admin Login" : "Log in as Admin"; visible: page.tab === "admin"; enabled: !bridge.busy && !bridge.view.activeAdminDetected; onClicked: bridge.claimAdmin(password.text) }
+                    ActionButton { objectName: "adminLoginButton"; text: bridge.view.adminLoginFailed ? "Retry Admin Login" : "Log in as Admin"; visible: page.tab === "admin"; enabled: !bridge.busy && !!bridge.view.adminNode; onClicked: bridge.claimAdmin(password.text) }
                     ActionButton { objectName: "continueAsUserButton"; text: "Continue as User"; secondary: true; visible: bridge.mode === "candidate" && page.tab === "user"; onClicked: bridge.stayUser() }
                     ActionButton { text: "Search LAN"; secondary: true; visible: page.tab === "discover"; onClicked: bridge.searchPools() }
                     Repeater {
@@ -87,9 +87,9 @@ Item {
                 ColumnLayout {
                     id: joinInfo; anchors.fill: parent; anchors.margins: 20; spacing: 12
                     Text { text: "Pairing with " + (bridge.view.pairingCafe || "cafe"); color: "#F4F7FB"; font.pixelSize: 20 }
-                    Text { text: bridge.view.pairingCode || "Waiting for code"; color: "#64BCC1"; font.pixelSize: 30; font.bold: true }
+                    Text { text: "Connection Code: " + (bridge.view.pairingCode || "------"); color: "#64BCC1"; font.pixelSize: 30; font.bold: true }
                     Text { text: bridge.view.pairingState || ""; color: "#a9bfd0"; wrapMode: Text.WordWrap; Layout.fillWidth: true }
-                    RowLayout { ActionButton { text: "New code"; onClicked: bridge.renewJoin() } ActionButton { text: "Cancel"; secondary: true; onClicked: bridge.cancelJoin() } }
+                    RowLayout { ActionButton { text: "New code"; enabled: !bridge.busy; onClicked: bridge.renewJoin() } ActionButton { text: "Cancel"; secondary: true; enabled: !bridge.busy; onClicked: bridge.cancelJoin() } }
                 }
             }
             Text { text: "Developed by Sumit Kumar · StickForYou"; color: "#8398AC"; font.pixelSize: 11; Layout.alignment: Qt.AlignHCenter }

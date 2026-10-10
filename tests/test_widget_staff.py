@@ -259,6 +259,145 @@ class StaffAccessTest(unittest.TestCase):
             self.assertEqual(popup_list.property("count"), count)
             QMetaObject.invokeMethod(popup, "close")
 
+    def test_staff_access_fits_1366_by_768_and_uses_role_specific_action(self):
+        engine = QQmlApplicationEngine()
+        engine.rootContext().setContextProperty("bridge", self.bridge)
+        qml = Path(__file__).resolve().parents[1] / "game_cafe" / "qml" / "App.qml"
+        engine.load(QUrl.fromLocalFile(str(qml)))
+        root = engine.rootObjects()[0]
+        root.setWidth(1366)
+        root.setHeight(768)
+        console = root.findChild(QObject, "mainLoader").property("item")
+        console.setProperty("staffPanel", "staff")
+        self.app.processEvents()
+
+        panel = root.findChild(QObject, "staffAccessPanel")
+        scroll = root.findChild(QObject, "staffAccessScroll")
+        content = root.findChild(QObject, "staffAccessContent")
+        password = root.findChild(QObject, "staffPasswordField")
+        authenticate = root.findChild(QObject, "staffAuthenticateButton")
+        self.assertGreaterEqual(content.width(), scroll.width() - 2)
+        self.assertGreaterEqual(password.width(), content.width() - 2)
+        self.assertGreaterEqual(authenticate.width(), content.width() - 2)
+
+        self.authorize()
+        self.bridge._set_view(adminNode=False, canSwitchAdmin=True,
+                              hasSession=False)
+        self.app.processEvents()
+
+        setup_row = root.findChild(QObject, "staffSessionSetupRow")
+        start_action = root.findChild(QObject, "staffStartButton")
+        action_row = root.findChild(QObject, "staffActionRow")
+        role_action = root.findChild(QObject, "staffRoleAction")
+        close_action = root.findChild(QObject, "staffCloseSoftware")
+        lock_action = root.findChild(QObject, "lockStaffControls")
+        self.assertIsNotNone(scroll)
+        self.assertLessEqual(panel.height(), console.height() * 0.34 + 1)
+        self.assertLessEqual(panel.y() + panel.height(), console.height())
+        self.assertTrue(scroll.property("visible"))
+        self.assertGreaterEqual(setup_row.width(), content.width() - 2)
+        self.assertGreaterEqual(start_action.width(), content.width() - 2)
+        self.assertGreaterEqual(action_row.width(), content.width() - 2)
+        self.assertGreater(role_action.width(), action_row.width() * 0.25)
+        self.assertGreater(close_action.width(), action_row.width() * 0.25)
+        self.assertGreater(lock_action.width(), action_row.width() * 0.25)
+        self.assertEqual(role_action.property("text"), "Switch to Admin")
+        self.assertTrue(close_action.property("visible"))
+        self.assertTrue(lock_action.property("visible"))
+
+        self.bridge._set_view(adminNode=True)
+        self.app.processEvents()
+        self.assertEqual(role_action.property("text"), "Sign Out")
+
+        root.setHeight(600)
+        self.app.processEvents()
+        self.assertGreater(scroll.property("contentHeight"), scroll.height())
+
+    def test_admin_node_user_console_signout_requires_two_confirmations(self):
+        self.store.update(lambda state: state["active_admin"].update(
+            pc_id=self.store.pc_id))
+        engine = QQmlApplicationEngine()
+        engine.rootContext().setContextProperty("bridge", self.bridge)
+        qml = Path(__file__).resolve().parents[1] / "game_cafe" / "qml" / "App.qml"
+        engine.load(QUrl.fromLocalFile(str(qml)))
+        root = engine.rootObjects()[0]
+        root.findChild(QObject, "mainLoader").property("item").setProperty(
+            "staffPanel", "staff")
+        self.authorize()
+        self.bridge._set_view(adminNode=True, canSwitchAdmin=True,
+                              hasSession=False)
+        self.app.processEvents()
+        sign_out = root.findChild(QObject, "staffRoleAction")
+        self.assertEqual(sign_out.property("text"), "Sign Out")
+
+        sign_out.clicked.emit()
+        sign_out.clicked.emit()
+        self.app.processEvents()
+        confirmation = root.property("confirmation")
+        self.assertEqual(confirmation.property("title").toString(),
+                         "Sign out of User Console?")
+        self.assertEqual(confirmation.property("label").toString(), "Continue")
+        self.assertFalse(self.store.take_local_commands())
+
+        QMetaObject.invokeMethod(root, "cancelConfirmation")
+        self.assertFalse(self.store.take_local_commands())
+        self.assertTrue(self.bridge.staffAuthorized)
+
+        sign_out.clicked.emit()
+        QMetaObject.invokeMethod(root, "acceptConfirmation")
+        self.app.processEvents()
+        confirmation = root.property("confirmation")
+        self.assertEqual(confirmation.property("title").toString(),
+                         "Confirm Sign Out")
+        self.assertEqual(confirmation.property("label").toString(),
+                         "Confirm Sign Out")
+        self.assertEqual(confirmation.property("cancelLabel").toString(),
+                         "Go Back")
+        self.assertFalse(self.store.take_local_commands())
+
+        QMetaObject.invokeMethod(root, "cancelConfirmation")
+        self.app.processEvents()
+        self.assertEqual(root.property("confirmation").property("title").toString(),
+                         "Sign out of User Console?")
+        self.assertFalse(self.store.take_local_commands())
+
+        QMetaObject.invokeMethod(root, "acceptConfirmation")
+        QMetaObject.invokeMethod(root, "acceptConfirmation")
+        QMetaObject.invokeMethod(root, "acceptConfirmation")
+        commands = self.store.take_local_commands()
+        self.assertEqual([action for action, _payload in commands],
+                         ["return_to_login"])
+        self.assertFalse(self.bridge.staffAuthorized)
+        self.assertEqual(self.store.snapshot()["active_admin"]["pc_id"],
+                         self.store.pc_id)
+
+    def test_user_pc_switch_to_admin_keeps_existing_direct_workflow(self):
+        engine = QQmlApplicationEngine()
+        engine.rootContext().setContextProperty("bridge", self.bridge)
+        qml = Path(__file__).resolve().parents[1] / "game_cafe" / "qml" / "App.qml"
+        engine.load(QUrl.fromLocalFile(str(qml)))
+        root = engine.rootObjects()[0]
+        root.findChild(QObject, "mainLoader").property("item").setProperty(
+            "staffPanel", "staff")
+        self.authorize()
+        self.bridge._set_view(adminNode=False, canSwitchAdmin=True,
+                              hasSession=False)
+        self.app.processEvents()
+        switch = root.findChild(QObject, "staffRoleAction")
+        self.assertEqual(switch.property("text"), "Switch to Admin")
+        switch.clicked.emit()
+        self.assertTrue(root.property("confirmation").property("title").isUndefined())
+        self.assertEqual(self.store.take_local_commands()[0][0], "open_admin")
+
+    def test_staff_actions_keep_distinct_start_add_and_close_treatments(self):
+        source = (Path(__file__).resolve().parents[1] / "game_cafe" / "qml" /
+                  "Console.qml").read_text(encoding="utf-8")
+        self.assertIn('objectName: "staffStartButton"', source)
+        self.assertIn('objectName: "staffAddButton"', source)
+        self.assertIn("customColor: theme.active", source)
+        self.assertIn('objectName: "staffCloseSoftware"', source)
+        self.assertIn("danger: true", source)
+
     def test_password_change_invalidates_authorization(self):
         self.authorize()
         self.store.update(lambda state: state.update(

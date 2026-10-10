@@ -279,6 +279,25 @@ class CafeBridge(QObject):
         return {"cafeName": snapshot["cafe_name"], "hasAvatar": bool(logo),
                 "avatarSource": "image://cafe/avatar/" + str(hash(logo)) if logo else ""}
 
+    def _admin_login_state(self, snapshot: dict, remote_online: bool) -> dict:
+        admin_id = snapshot["active_admin"].get("pc_id")
+        admin_node = admin_id == self.store.pc_id
+        return {
+            "adminNode": admin_node,
+            "adminOnline": bool(self.runtime.is_admin() if admin_node
+                                else remote_online),
+            "adminPcName": snapshot["members"].get(admin_id, {}).get(
+                "name", "Admin PC"),
+            "activeAdminDetected": bool(remote_online and not admin_node),
+        }
+
+    @staticmethod
+    def _candidate_status(state: dict) -> str:
+        if state.get("adminNode"):
+            return "This PC is the Admin Node - choose Admin or User access"
+        availability = "online" if state.get("adminOnline") else "offline"
+        return f"Admin {state.get('adminPcName', 'PC')} is {availability} - continue as User"
+
     @Slot()
     def begin(self) -> None:
         if self.child:
@@ -290,21 +309,21 @@ class CafeBridge(QObject):
                 self._runtime_started = True
             if self.store.current_pool_id:
                 live = self.runtime.verified_admin_online()
-                return "candidate", [], self._branding(self.store.snapshot()), live
-            return "onboarding", discover(timeout=1.5), {}, False
+                snapshot = self.store.snapshot()
+                return ("candidate", [], self._branding(snapshot),
+                        self._admin_login_state(snapshot, live))
+            return "onboarding", discover(timeout=1.5), {}, {}
         def done(result, error):
             if error:
                 self._set_status("Connection failed")
                 self._show_notice("Could not start", str(error), True)
                 self._set_mode("splash")
                 return
-            mode, found, branding, active_admin = result
+            mode, found, branding, login_state = result
             self._set_view(pools=self._distinct_pools(found),
-                           activeAdminDetected=active_admin, **branding)
+                           **login_state, **branding)
             if mode == "candidate":
-                self._set_status("Admin connected - continue as User"
-                                 if active_admin else
-                                 "Choose Admin or User access")
+                self._set_status(self._candidate_status(login_state))
                 self._set_mode(mode)
                 self.refresh()
             else:
@@ -458,10 +477,15 @@ class CafeBridge(QObject):
     def _begin_join(self, pool: dict, name: str, old_pool: str | None) -> None:
         self._join_generation += 1
         generation = self._join_generation
+        request = self.runtime.prepare_join_request(pool["poolId"], name)
         self._join = {"pool": pool, "name": name, "oldPool": old_pool,
-                      "generation": generation, "requestId": None,
-                      "private": None}
-        self._set_view(pairingCode="", pairingState="Sending request",
+                      "generation": generation,
+                      "requestId": request["request_id"],
+                      "private": request["private"],
+                      "cancelToken": request["cancel_token"],
+                      "request": request}
+        self._set_view(pairingCode=request["code"],
+                       pairingState="Sending request to Admin",
                        pairingCafe=pool["cafeName"])
         self._set_mode("joining")
         def done(result, error):
@@ -470,24 +494,45 @@ class CafeBridge(QObject):
             if error:
                 self._set_view(pairingState=f"Request failed: {error}")
                 return
-            self._join["requestId"], self._join["private"] = result
-            self._set_view(pairingState="Waiting for Admin approval")
+            self._set_view(pairingState="Waiting for Admin approval...")
             self._poll_join()
-        self._submit("request_join", lambda: self.runtime.request_join(
-            pool["ip"], pool["poolId"], name), done, blocking=True)
+        self._submit("request_join", lambda: self.runtime.send_join_request(
+            pool["ip"], request), done, blocking=True)
 
     @Slot()
     def renewJoin(self) -> None:
         if self._join:
             item = self._join
+            self._cancel_join_request(item)
             self._begin_join(item["pool"], item["name"], item["oldPool"])
 
     @Slot()
     def cancelJoin(self) -> None:
         self._join_generation += 1
-        old_pool = self._join.get("oldPool") if self._join else None
+        item = self._join
+        old_pool = item.get("oldPool") if item else None
         self._join = None
         self._set_mode("admin" if old_pool else "onboarding")
+        self._cancel_join_request(item)
+
+    def _cancel_join_request(self, item: dict | None) -> None:
+        if not item or not item.get("requestId") or not item.get("cancelToken"):
+            return
+        self._submit("cancel_join", lambda: self.runtime.cancel_join(
+            item["pool"]["ip"], item["requestId"], item["cancelToken"]
+        ), lambda _result, _error: None)
+
+    def cancel_pending_join_for_shutdown(self) -> None:
+        """Best effort only: a network failure must never prevent local exit."""
+        self._join_generation += 1
+        item, self._join = self._join, None
+        if not item or not item.get("requestId") or not item.get("cancelToken"):
+            return
+        try:
+            self.runtime.cancel_join(item["pool"]["ip"], item["requestId"],
+                                     item["cancelToken"])
+        except Exception:
+            pass
 
     def _poll_join(self) -> None:
         if not self._join or not self._join["requestId"] or self._poll_pending:
@@ -502,10 +547,9 @@ class CafeBridge(QObject):
                 self._set_view(pairingState=f"Connection failed: {error}")
                 return
             state, code, branding = result
-            if state == "verify":
-                self._set_view(pairingCode=code,
-                               pairingState="Read this code to the Admin · Expires in five minutes")
-            elif state in ("expired", "rejected"):
+            if state == "pending":
+                self._set_view(pairingState="Waiting for Admin approval...")
+            elif state in ("expired", "rejected", "cancelled"):
                 self._set_view(pairingCode="", pairingState=
                                "Request expired or rejected · Generate a new code")
                 self._join["requestId"] = None
@@ -545,10 +589,14 @@ class CafeBridge(QObject):
         feedback = self.store.local("customer_feedback") or ""
         pending = self.store.pending_joins() if self.runtime and self.runtime.is_admin() else []
         peers = {item["pc_id"]: item for item in self.store.peers()} if self.runtime else {}
-        active_admin = bool(
-            self.runtime and self._mode == "candidate"
-            and self.runtime.confirmed_remote_admin_online()
-        )
+        admin_id = snap["active_admin"].get("pc_id")
+        admin_node = admin_id == own
+        remote_admin_online = bool(
+            self.runtime and self._mode == "candidate" and not admin_node
+            and self.runtime.confirmed_remote_admin_online())
+        admin_online = bool(
+            self.runtime and (self.runtime.is_admin() if admin_node
+                              else remote_admin_online))
         return {
             "snapshot": snap, "rows": rows,
             "history": history_rows(snap, None if all_history else selected),
@@ -579,8 +627,11 @@ class CafeBridge(QObject):
             "hasSession": bool(session),
             "accessAllowed": phase in ("buffer", "timed", "open", "paused"),
             "canSwitchAdmin": session is None,
-            "adminNode": snap["active_admin"].get("pc_id") == own,
-            "activeAdminDetected": active_admin,
+            "adminNode": admin_node,
+            "adminOnline": admin_online,
+            "adminPcName": snap["members"].get(admin_id, {}).get(
+                "name", "Admin PC"),
+            "activeAdminDetected": remote_admin_online,
             "feedback": feedback,
             "connectionNote": self.store.local("admin_connection_note") or "",
             "hasAvatar": bool(snap.get("logo")),
@@ -638,10 +689,7 @@ class CafeBridge(QObject):
             result.pop("session")
             self._set_view(**result)
             if self._mode == "candidate":
-                self._set_status(
-                    "Admin connected - continue as User"
-                    if result["activeAdminDetected"] else
-                    "Choose Admin or User access")
+                self._set_status(self._candidate_status(result))
             if self._mode == "widget":
                 self.host.update_widget_access(bool(result["accessAllowed"]))
         self._submit("refresh", lambda: self._collect_state(selected, all_history), done)
@@ -746,11 +794,6 @@ class CafeBridge(QObject):
             return
         self._action("remote_exit", lambda: self.runtime.remote_exit(pc_id),
                      "Target accepted shutdown; waiting for it to disconnect.")
-
-    @Slot(str)
-    def preparePairing(self, request_id: str) -> None:
-        self._action("prepare_pairing", lambda:
-                     self.runtime.prepare_join_pairing(request_id))
 
     @Slot(str, str, str, str)
     def approvePairing(self, request_id: str, pc_id: str,

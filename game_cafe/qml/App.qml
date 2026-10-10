@@ -16,15 +16,41 @@ ApplicationWindow {
     Material.accent: "#D85288"
     property var confirmation: ({})
     property var notice: bridge.notice
-    function ask(title, message, label, action) {
-        confirmation = ({ title: title, message: message, label: label, action: action })
+    function ask(title, message, label, action, cancelLabel, cancelAction) {
+        confirmation = ({ title: title, message: message, label: label,
+                          action: action, cancelLabel: cancelLabel || "Cancel",
+                          cancelAction: cancelAction })
     }
     function confirmAdminExit() {
         ask("Exit GameGrid",
             "Exiting disconnects this Admin PC. Existing sessions on other User PCs will continue independently.",
             "Exit Application", function() { bridge.closeAdmin() })
     }
+    function confirmAdminSignOut() {
+        ask("Sign out of Admin?",
+            "You will return to the GameGrid login screen. The Admin system will continue running and connected PCs will remain managed.",
+            "Continue", function() {
+                root.ask("Confirm Sign Out",
+                         "Are you sure you want to sign out of the Admin dashboard?",
+                         "Confirm Sign Out", function() { bridge.signOutAdmin() },
+                         "Go Back", function() { root.confirmAdminSignOut() })
+            })
+    }
+    function confirmUserConsoleSignOut() {
+        ask("Sign out of User Console?",
+            "You will return to the GameGrid login screen. The Admin system will continue running in the background.",
+            "Continue", function() {
+                root.ask("Confirm Sign Out",
+                         "Are you sure you want to sign out of the User Console?",
+                         "Confirm Sign Out", function() { bridge.switchAdmin() },
+                         "Go Back", function() { root.confirmUserConsoleSignOut() })
+            })
+    }
     function cancelConfirmation() {
+        if (confirmation.cancelAction) {
+            confirmation.cancelAction()
+            return
+        }
         confirmation = ({})
     }
     function acceptConfirmation() {
@@ -80,7 +106,7 @@ ApplicationWindow {
                 RowLayout {
                     Layout.alignment: Qt.AlignRight
                     spacing: 10
-                    ActionButton { text: "Cancel"; secondary: true; visible: !root.notice.title; onClicked: root.cancelConfirmation() }
+                    ActionButton { objectName: "confirmationCancelButton"; text: root.confirmation.cancelLabel || "Cancel"; secondary: true; visible: !root.notice.title; onClicked: root.cancelConfirmation() }
                     ActionButton {
                         text: root.notice.title ? "OK" : root.confirmation.label || "Confirm"
                         danger: !!root.notice.error || root.confirmation.label === "Exit Application"

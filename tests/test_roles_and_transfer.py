@@ -2,9 +2,9 @@
 
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from concurrent.futures import ThreadPoolExecutor
 import time
 import unittest
+import uuid
 from unittest.mock import Mock, patch
 
 from game_cafe.runtime import PEER_ONLINE_SECONDS, Runtime, customer_controls
@@ -147,6 +147,17 @@ class AdminHandoffTest(unittest.TestCase):
                                 auto_signout_minutes=30)
         self.assertEqual(self.first.snapshot()["cafe_name"], "Open Café")
 
+    def test_admin_node_can_host_local_guest_session_without_losing_authority(self):
+        self.admin.login_admin(PASSWORD)
+        self.admin.admin_ui_open = False
+        self.admin.admin_signing_key = None
+        self.admin.local_staff_session_action(
+            "start", PASSWORD, uuid.uuid4().hex,
+            kind="timed", paid_minutes=60, buffer_minutes=0)
+        self.assertTrue(self.admin.is_admin())
+        self.assertFalse(self.admin.admin_ui_open)
+        self.assertIsNotNone(self.first.snapshot()["sessions"][self.first.pc_id])
+
     def test_later_online_pc_follows_existing_admin_without_password(self):
         with patch.object(self.admin.network, "call", side_effect=OSError("offline")):
             self.admin.login_admin(PASSWORD)
@@ -196,25 +207,13 @@ class AdminHandoffTest(unittest.TestCase):
             self.assertFalse(rows[pc_id]["online"])
             self.assertFalse(rows[pc_id]["start"])
 
-    def test_competing_claims_converge_after_contact(self):
-        self.first.update(lambda state: state["active_admin"].update(expires_at=0))
-        self.second.apply_snapshot(self.first.snapshot())
-        # A partition can briefly create two claims; no quorum guarantee is claimed.
-        with (patch.object(self.admin.network, "call", side_effect=OSError("partition")),
-              patch.object(self.user.network, "call", side_effect=OSError("partition"))):
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                attempts = [executor.submit(runtime.login_admin, PASSWORD)
-                            for runtime in (self.admin, self.user)]
-                for attempt in attempts:
-                    attempt.result()
-        self.assertTrue(self.admin.is_admin() and self.user.is_admin())
-        for runtime in (self.admin, self.user):
-            runtime._poll_peer_statuses()
-            runtime._settle_admin_ownership()
-        winner = max(self.first.pc_id, self.second.pc_id)
-        self.assertEqual(self.first.pc_id if self.admin.is_admin()
-                         else self.second.pc_id, winner)
-        self.assertFalse(self.admin.is_admin() and self.user.is_admin())
+    def test_offline_member_cannot_claim_designated_admin_role(self):
+        with patch.object(self.user.network, "call", side_effect=OSError("partition")):
+            with self.assertRaisesRegex(RuntimeError, "designated Admin Node is offline"):
+                self.user.login_admin(PASSWORD)
+        self.assertFalse(self.user.is_admin())
+        self.assertEqual(self.second.snapshot()["active_admin"]["pc_id"],
+                         self.first.pc_id)
 
     def test_registered_user_cannot_push_a_forged_admin_claim(self):
         self.admin.login_admin(PASSWORD)
@@ -249,10 +248,50 @@ class AdminHandoffTest(unittest.TestCase):
         self.assertEqual(restarted.snapshot()["active_admin"]["pc_id"],
                          self.second.pc_id)
 
-    def test_restart_does_not_inherit_admin_claim(self):
+    def test_restart_restores_signed_admin_node_without_staff_login(self):
         self.admin.login_admin(PASSWORD)
-        restarted = Runtime(self.first)
+        term = self.first.snapshot()["active_admin"]["term"]
+        reopened_store = Store(self.first.path)
+        restarted = Runtime(reopened_store)
         self.assertFalse(restarted.is_admin())
+        try:
+            with (patch.object(restarted.network, "start") as network_start,
+                  patch.object(restarted.network, "stop"),
+                  patch.object(restarted, "_background_loop")):
+                restarted.start()
+                network_start.assert_called_once()
+                self.assertTrue(restarted.is_admin())
+                self.assertFalse(restarted.admin_ui_open)
+                self.assertIsNone(restarted.admin_signing_key)
+                self.assertEqual(restarted.snapshot()["active_admin"]["term"], term)
+                restarted.stop()
+        finally:
+            reopened_store.close()
+
+    def test_restart_after_handoff_cannot_restore_old_claim(self):
+        self.admin.login_admin(PASSWORD)
+        self.user.take_admin(PASSWORD)
+        restarted = Runtime(self.first)
+        with (patch.object(restarted.network, "start"),
+              patch.object(restarted.network, "stop"),
+              patch.object(restarted, "_background_loop")):
+            restarted.start()
+            self.assertFalse(restarted.is_admin())
+            restarted.stop()
+
+    def test_restart_after_password_change_preserves_admin_node(self):
+        self.admin.login_admin(PASSWORD)
+        self.admin.admin_action("password", new_password="new long test password")
+        restarted = Runtime(self.first)
+        with (patch.object(restarted.network, "start"),
+              patch.object(restarted.network, "stop"),
+              patch.object(restarted, "_background_loop")):
+            restarted.start()
+            self.assertTrue(restarted.is_admin())
+            self.assertFalse(restarted.admin_ui_open)
+            restarted._renew_admin_lease()
+            self.assertTrue(restarted.is_admin())
+            restarted.stop()
 
 
 if __name__ == "__main__":

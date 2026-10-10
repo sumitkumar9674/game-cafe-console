@@ -425,6 +425,23 @@ class CafeBridge(QObject):
             self.refresh()
         self._submit("user_window", self.host.start_console, done, blocking=True)
 
+    def _return_to_login(self) -> None:
+        if self._busy or self.host.console_transitioning:
+            return
+        self.runtime.admin_ui_open = False
+        self.runtime.admin_signing_key = None
+        self.host.console_transitioning = True
+
+        def done(result, error):
+            self.host.console_transitioning = False
+            if error:
+                self._show_notice("Login transition failed", str(error), True)
+                return
+            self._set_mode("candidate")
+            self.refresh()
+
+        self._submit("login_window", self.host.stop_console, done, blocking=True)
+
     @Slot(str, str)
     def startJoin(self, pool_id: str, requested_name: str) -> None:
         if self.store.current_pool_id:
@@ -562,6 +579,7 @@ class CafeBridge(QObject):
             "hasSession": bool(session),
             "accessAllowed": phase in ("buffer", "timed", "open", "paused"),
             "canSwitchAdmin": session is None,
+            "adminNode": snap["active_admin"].get("pc_id") == own,
             "activeAdminDetected": active_admin,
             "feedback": feedback,
             "connectionNote": self.store.local("admin_connection_note") or "",
@@ -1037,7 +1055,11 @@ class CafeBridge(QObject):
                                   "End this session before switching to Admin.", True)
                 self._revoke_staff()
                 return
-            self._post_child("open_admin", {"password_sealed": credential})
+            snap = self.store.snapshot()
+            action = ("return_to_login" if snap and
+                      snap["active_admin"].get("pc_id") == self.store.pc_id
+                      else "open_admin")
+            self._post_child(action, {"password_sealed": credential})
             self._revoke_staff()
 
     @Slot()
@@ -1079,6 +1101,16 @@ class CafeBridge(QObject):
     @Slot()
     def closeAdmin(self) -> None:
         self.closeApplication()
+
+    @Slot()
+    def signOutAdmin(self) -> None:
+        if self.child or self._mode != "admin" or self._busy:
+            return
+        self.runtime.admin_ui_open = False
+        self.runtime.admin_signing_key = None
+        self._set_view(adminLoginFailed=False)
+        self._set_mode("candidate")
+        self.refresh()
 
     @Slot()
     def closeApplication(self) -> None:
@@ -1159,6 +1191,24 @@ class CafeBridge(QObject):
                 else:
                     self._enter_admin()
             self._submit("take_admin", work, done, blocking=True)
+        elif action == "return_to_login":
+            def work():
+                password = open_local_password(self.host.command_private_key,
+                                               payload["password_sealed"])
+                snap = self.runtime.snapshot()
+                if (not snap or snap["active_admin"].get("pc_id") != self.store.pc_id
+                        or snap["sessions"].get(self.store.pc_id)
+                        or not verify_password(password, snap["admin_password"])):
+                    raise PermissionError("Staff authorization or Admin Node state changed.")
+
+            def done(result, error):
+                if error:
+                    self.store.set_local("customer_feedback", f"Login failed: {error}")
+                    self._show_notice("Cannot return to login", str(error), True)
+                else:
+                    self._return_to_login()
+
+            self._submit("return_to_login", work, done, blocking=True)
         elif action == "close_software":
             def work():
                 password = open_local_password(self.host.command_private_key,

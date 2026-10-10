@@ -432,6 +432,7 @@ Item {
                         }
                     }
                 }
+                ActionButton { objectName: "adminSignOutButton"; text: "Sign out of Admin"; secondary: true; onClicked: bridge.signOutAdmin() }
                 ActionButton { text: "Close software"; danger: true; onClicked: root.confirmAdminExit() }
             }
         }

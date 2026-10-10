@@ -178,6 +178,16 @@ class StaffAccessTest(unittest.TestCase):
         self.assertEqual(self.bridge.notice["title"],
                          "Staff authentication failed")
 
+    def test_designated_admin_node_staff_access_returns_to_login(self):
+        self.store.update(lambda state: state["active_admin"].update(
+            pc_id=self.store.pc_id))
+        self.authorize()
+        self.bridge.switchAdmin()
+        commands = self.store.take_local_commands()
+        self.assertEqual([action for action, _ in commands], ["return_to_login"])
+        self.assertNotIn(PASSWORD, str(commands))
+        self.assertFalse(self.bridge.staffAuthorized)
+
     def test_repeated_failures_temporarily_block_staff_login(self):
         self.bridge._staff_failed_attempts = 4
         self.bridge.authenticateStaff("incorrect password")

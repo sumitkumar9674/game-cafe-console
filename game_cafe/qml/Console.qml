@@ -141,7 +141,7 @@ Item {
                         }
                     }
                     Rectangle { Layout.fillWidth: true; implicitHeight: 1; color: "#455C73" }
-                    ActionButton { text: "Switch to Admin"; Layout.fillWidth: true; enabled: bridge.view.canSwitchAdmin && !bridge.view.hasSession && !bridge.busy; onClicked: bridge.switchAdmin() }
+                    ActionButton { text: bridge.view.adminNode ? "Return to Login" : "Switch to Admin"; Layout.fillWidth: true; enabled: bridge.view.canSwitchAdmin && !bridge.view.hasSession && !bridge.busy; onClicked: bridge.switchAdmin() }
                     ActionButton { objectName: "staffCloseSoftware"; text: "Close Software"; Layout.fillWidth: true; danger: true; enabled: !bridge.busy; onClicked: {
                         if (bridge.hasLocalSession()) {
                             root.ask("Active Session Detected",

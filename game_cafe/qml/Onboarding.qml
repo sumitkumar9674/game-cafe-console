@@ -42,7 +42,7 @@ Item {
                     anchors.fill: parent
                     anchors.margins: 21
                     spacing: 12
-                    Text { objectName: "loginRoleHeading"; text: page.tab === "create" ? "Create a local cafe" : page.tab === "admin" ? "Claim Admin role" : page.tab === "user" ? "Continue as User" : "Nearby cafes"; color: "#F4F7FB"; font.pixelSize: 20; font.bold: true }
+                    Text { objectName: "loginRoleHeading"; text: page.tab === "create" ? "Create a local cafe" : page.tab === "admin" ? "Admin login" : page.tab === "user" ? "Continue as User" : "Nearby cafes"; color: "#F4F7FB"; font.pixelSize: 20; font.bold: true }
                     Text { text: "Your cafe runs on your local network."; color: "#A8B8CA"; visible: page.tab === "create" }
                     Text { objectName: "activeAdminMessage"; text: "An Admin is already active for this cafe. Continue as User."; color: "#A8B8CA"; visible: bridge.mode === "candidate" && bridge.view.activeAdminDetected; wrapMode: Text.WordWrap; Layout.fillWidth: true }
                     TextField { id: cafe; placeholderText: "Cafe name"; Layout.fillWidth: true; visible: page.tab === "create" }
@@ -58,7 +58,7 @@ Item {
                     }
                     TextField { id: confirmation; placeholderText: "Confirm password"; echoMode: TextInput.Password; Layout.fillWidth: true; visible: page.tab === "create" }
                     ActionButton { text: "Create and open Admin Dashboard"; visible: page.tab === "create"; onClicked: bridge.createCafe(cafe.text, pc.text, admin.text, password.text, confirmation.text) }
-                    ActionButton { objectName: "adminLoginButton"; text: bridge.view.adminLoginFailed ? "Retry Admin Login" : "Become Admin"; visible: page.tab === "admin"; enabled: !bridge.busy && !bridge.view.activeAdminDetected; onClicked: bridge.claimAdmin(password.text) }
+                    ActionButton { objectName: "adminLoginButton"; text: bridge.view.adminLoginFailed ? "Retry Admin Login" : "Log in as Admin"; visible: page.tab === "admin"; enabled: !bridge.busy && !bridge.view.activeAdminDetected; onClicked: bridge.claimAdmin(password.text) }
                     ActionButton { objectName: "continueAsUserButton"; text: "Continue as User"; secondary: true; visible: bridge.mode === "candidate" && page.tab === "user"; onClicked: bridge.stayUser() }
                     ActionButton { text: "Search LAN"; secondary: true; visible: page.tab === "discover"; onClicked: bridge.searchPools() }
                     Repeater {

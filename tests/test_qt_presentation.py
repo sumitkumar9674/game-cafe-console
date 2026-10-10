@@ -20,6 +20,7 @@ from PySide6.QtWidgets import QApplication
 from game_cafe import sessions
 from game_cafe.branding import APP_ICON_PATH, APP_LOGO_PATH, app_logo_source, valid_image
 from game_cafe.qt_bridge import CafeBridge, RecordListModel
+from game_cafe.security import create_local_command_key, seal_local_password
 from game_cafe.qt_app import AvatarProvider
 from game_cafe.storage import Store, new_pool
 
@@ -569,6 +570,72 @@ class QtPresentationTest(unittest.TestCase):
         self.assertTrue(self.bridge.view["activeAdminDetected"])
         self.host.start_console.assert_not_called()
         self.host.stop_console.assert_not_called()
+
+    def test_admin_signout_keeps_node_and_network_running(self):
+        snapshot, secret = new_pool("Cafe", self.store.pc_id, "PC-01", "Admin",
+                                    "long test password", self.store.node_public_key())
+        self.store.save_pool(snapshot, secret, join=True)
+        self.bridge._set_mode("admin")
+        self.runtime.admin_ui_open = True
+        self.runtime.admin_signing_key = object()
+        self.bridge.signOutAdmin()
+        self.assertEqual(self.bridge.mode, "candidate")
+        self.assertFalse(self.runtime.admin_ui_open)
+        self.assertIsNone(self.runtime.admin_signing_key)
+        self.runtime.stop.assert_not_called()
+        self.runtime.release_admin.assert_not_called()
+        self.host.shutdown.assert_not_called()
+        self.host.start_console.assert_not_called()
+
+    def test_admin_node_user_console_keeps_authority_and_returns_to_login(self):
+        snapshot, secret = new_pool("Cafe", self.store.pc_id, "PC-01", "Admin",
+                                    "long test password", self.store.node_public_key())
+        self.store.save_pool(snapshot, secret, join=True)
+        self.runtime.is_admin.return_value = True
+        self.bridge._set_mode("candidate")
+        self.bridge.stayUser()
+        self.wait_for_idle()
+        self.assertEqual(self.bridge.mode, "widget")
+        self.host.start_console.assert_called_once()
+        self.assertTrue(self.runtime.is_admin())
+        self.bridge._return_to_login()
+        self.wait_for_idle()
+        self.assertEqual(self.bridge.mode, "candidate")
+        self.host.stop_console.assert_called_once()
+        self.runtime.release_admin.assert_not_called()
+
+    def test_admin_node_staff_route_verifies_password_before_login(self):
+        snapshot, secret = new_pool("Cafe", self.store.pc_id, "PC-01", "Admin",
+                                    "long test password", self.store.node_public_key())
+        self.store.save_pool(snapshot, secret, join=True)
+        private, public = create_local_command_key()
+        self.host.command_private_key = private
+        self.runtime.snapshot.return_value = self.store.snapshot()
+        self.bridge._set_mode("widget")
+        self.bridge._handle_local_command("return_to_login", {
+            "password_sealed": seal_local_password(public, "wrong password")})
+        self.wait_for_idle()
+        self.assertEqual(self.bridge.mode, "widget")
+        self.host.stop_console.assert_not_called()
+
+        self.bridge._handle_local_command("return_to_login", {
+            "password_sealed": seal_local_password(public, "long test password")})
+        self.wait_for_idle()
+        self.assertEqual(self.bridge.mode, "candidate")
+        self.host.stop_console.assert_called_once()
+        self.runtime.take_admin.assert_not_called()
+
+    def test_admin_settings_exposes_signout_separate_from_exit(self):
+        self.bridge._set_mode("admin")
+        engine = QQmlApplicationEngine()
+        engine.rootContext().setContextProperty("bridge", self.bridge)
+        qml = Path(__file__).resolve().parents[1] / "game_cafe" / "qml" / "App.qml"
+        engine.load(QUrl.fromLocalFile(str(qml)))
+        root = engine.rootObjects()[0]
+        admin = root.findChild(QObject, "adminPage")
+        admin.setProperty("section", "Settings")
+        self.app.processEvents()
+        self.assertIsNotNone(root.findChild(QObject, "adminSignOutButton"))
 
     def test_login_selects_user_and_disables_admin_when_admin_appears(self):
         self.bridge._set_mode("candidate")

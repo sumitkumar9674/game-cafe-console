@@ -9,6 +9,8 @@ import threading
 import time
 import uuid
 
+from cryptography.exceptions import InvalidSignature
+
 from . import sessions
 from .desktops import active_desktop_name, switch
 from .lifecycle import lifecycle_event
@@ -74,6 +76,7 @@ class Runtime:
             # The bound LAN port excludes a second parent process on this PC.
             if self.store.current_pool_id:
                 self.store.set_local(self._lease_key("until"), "0")
+                self._resume_designated_admin()
             self.recover_interrupted_session()
             self._migrate_legacy_owner_session()
         except Exception:
@@ -227,6 +230,39 @@ class Runtime:
 
     def _lease_key(self, field: str) -> str:
         return f"lease_{field}:{self.store.current_pool_id}"
+
+    def _resume_designated_admin(self) -> None:
+        """Restore only this PC's signed designation, never elect a new owner."""
+        with self.lock:
+            snap = self.snapshot()
+            if not snap or snap["active_admin"].get("pc_id") != self.store.pc_id:
+                return
+            claim = snap["active_admin"]
+            term = int(claim.get("term", 0))
+            if int(self.store.local(self._lease_key("handed_off")) or 0) >= term:
+                return
+            proof = {"pool_id": snap["pool_id"], "candidate": self.store.pc_id,
+                     "term": term}
+            signature = claim.get("proof") or ""
+            trusted_keys = {snap["admin_signing"]["public"],
+                            *snap.get("admin_signing_keys", [])}
+            for public_key in trusted_keys:
+                try:
+                    verify_admin_proof(public_key, proof, signature)
+                    break
+                except (ValueError, InvalidSignature):
+                    continue
+            else:
+                return  # An unsigned or invalid claim needs a password-backed login.
+            self._hold_local_claim(term)
+
+            def extend(state):
+                active = state["active_admin"]
+                if active.get("pc_id") != self.store.pc_id or active.get("term") != term:
+                    raise RuntimeError("Admin designation changed during startup.")
+                active["expires_at"] = time.time() + LEASE_SECONDS
+
+            self.store.update(extend)
 
     def is_admin(self) -> bool:
         snap = self.snapshot()
@@ -382,7 +418,7 @@ class Runtime:
         return bool(snap and not snap["sessions"].get(self.store.pc_id))
 
     def take_admin(self, password: str) -> None:
-        """Authenticate, then transfer from a live Admin or claim locally."""
+        """Authenticate, then log in locally or use the existing live handoff."""
         live_admin = self._find_live_admin()
         snap = self.snapshot()
         if not snap or not verify_password(password, snap["admin_password"]):
@@ -417,7 +453,7 @@ class Runtime:
         self._activate_admin(term)
 
     def login_admin_with_unlocked_key(self) -> None:
-        """Use a local claim when no reachable Admin responds."""
+        """Only the saved Admin Node can renew its own designation locally."""
         if not self.can_become_admin():
             raise RuntimeError("A PC with an active customer session cannot be Admin.")
         if self.admin_signing_key is None:
@@ -429,6 +465,11 @@ class Runtime:
         if self._find_live_admin():
             raise RuntimeError("An active Admin is online; use Switch to Admin to transfer.")
         snap = self.snapshot()
+        if snap["active_admin"].get("pc_id") != self.store.pc_id:
+            raise RuntimeError("The designated Admin Node is offline; Admin transfer requires it to be online.")
+        if int(self.store.local(self._lease_key("handed_off")) or 0) >= \
+                int(snap["active_admin"].get("term", 0)):
+            raise RuntimeError("This PC handed off Admin control; reconnect to the current Admin Node.")
         term = max(int(snap["active_admin"].get("term", 0)),
                    int(self.store.local(self._lease_key("term")) or 0)) + 1
         self._hold_local_claim(term)
@@ -1005,6 +1046,8 @@ class Runtime:
                                    data.get("signature", ""))
                 # Stop Admin writes before the new PC claims the role.
                 self.handoff_until = time.time() + 30
+                self.store.set_local(self._lease_key("handed_off"),
+                                     str(snap["active_admin"]["term"]))
                 self.store.set_local(self._lease_key("until"), "0")
                 self.admin_ui_open = False
                 self.notify("role_lost")

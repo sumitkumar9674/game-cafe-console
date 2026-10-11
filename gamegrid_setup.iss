@@ -1,5 +1,5 @@
 #define MyAppName "GameGrid"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.1.1"
 #define MyAppPublisher "StickForYou"
 #define MyAppExeName "GameCafeConsole.exe"
 
@@ -17,7 +17,7 @@ DefaultGroupName=GameGrid
 DisableProgramGroupPage=yes
 UsePreviousAppDir=yes
 OutputDir=release
-OutputBaseFilename=GameGrid-Setup-1.0.0
+OutputBaseFilename=GameGrid-Setup-1.1.1
 SetupIconFile=installer\assets\gamegrid.ico
 WizardStyle=modern
 WizardImageFile=installer\assets\wizard_gamegrid.bmp
@@ -34,7 +34,7 @@ RestartApplications=no
 SetupLogging=yes
 VersionInfoDescription=GameGrid setup installer
 VersionInfoProductName=GameGrid
-VersionInfoVersion=1.0.0.0
+VersionInfoVersion=1.1.1.0
 VersionInfoCompany=StickForYou
 
 [Languages]

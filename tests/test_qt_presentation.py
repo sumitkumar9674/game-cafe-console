@@ -658,6 +658,32 @@ class QtPresentationTest(unittest.TestCase):
         self.assertNotIn("bridge.preparePairing", qml)
         self.assertNotIn('text: "Pair"', qml)
 
+    def test_registered_computer_removal_has_named_confirmation(self):
+        qml = (Path(__file__).resolve().parents[1] /
+               "game_cafe" / "qml" / "Admin.qml").read_text(encoding="utf-8")
+        self.assertIn('text: "Remove Computer"', qml)
+        self.assertIn('visible: rowData.canRemove', qml)
+        self.assertIn('" (ID: " + rowData.pcId', qml)
+        self.assertIn('bridge.removeComputer(rowData.pcId)', qml)
+
+    def test_remove_computer_routes_by_immutable_id_and_clears_selection(self):
+        pc_id = "a" * 32
+        self.bridge.member_model.update_rows([{
+            "pcId": pc_id, "name": "PC-02", "canRemove": True,
+        }])
+        self.bridge._selected_pc = pc_id
+        self.bridge._expanded_pc = pc_id
+        self.runtime.remove_computer.return_value = {
+            "removed": True, "pc_id": pc_id, "pc_name": "PC-02"}
+
+        self.bridge.removeComputer(pc_id)
+        self.wait_for_idle()
+
+        self.runtime.remove_computer.assert_called_once_with(pc_id)
+        self.assertEqual(self.bridge.selectedPcId, "")
+        self.assertEqual(self.bridge.expandedPcId, "")
+        self.assertEqual(self.bridge.notice["title"], "Computer removed")
+
     def test_designated_admin_node_offers_admin_or_user_when_not_logged_in(self):
         snapshot, secret = new_pool("Cafe", self.store.pc_id, "PC-01", "Admin",
                                     "long test password", self.store.node_public_key())

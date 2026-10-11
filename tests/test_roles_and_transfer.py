@@ -119,6 +119,21 @@ class AdminHandoffTest(unittest.TestCase):
         self.assertFalse(any(customer_controls(
             self.second.snapshot(), self.second.pc_id).values()))
 
+    def test_transfer_preserves_removed_membership_revocation(self):
+        self.admin.login_admin(PASSWORD)
+        removed_id = self.offline_ids[0]
+        result = self.admin.remove_computer(removed_id)
+        notice = self.first.snapshot()["revocations"][removed_id]
+        self.assertTrue(result["removed"])
+        self.assertNotIn(removed_id, self.first.snapshot()["members"])
+
+        self.user.take_admin(PASSWORD)
+
+        transferred = self.second.snapshot()
+        self.assertTrue(self.user.is_admin())
+        self.assertNotIn(removed_id, transferred["members"])
+        self.assertEqual(transferred["revocations"][removed_id], notice)
+
     def test_customer_authority_survives_transfer_both_directions(self):
         customer = self.first.create_customer(
             "Transfer Customer", "Owner", "create-customer")

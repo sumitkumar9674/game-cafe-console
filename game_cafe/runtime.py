@@ -27,7 +27,8 @@ from .presentation import validate_add, validate_start
 from .security import (create_admin_signing_record, sign_admin_proof,
                        create_handoff_keypair, open_admin_handoff,
                        seal_admin_handoff, sign_node, unlock_admin_signing_key,
-                       verify_admin_proof, verify_node)
+                       verify_admin_proof, verify_node,
+                       verify_pairing_revocation)
 from .storage import Store, hash_password, verify_password
 
 
@@ -40,6 +41,7 @@ CUSTOMER_AUTH_BLOCK_SECONDS = 30
 HANDOFF_EXPIRY_SECONDS = 60
 HANDOFF_CHUNK_HEX_LENGTH = 300_000
 MAX_HANDOFF_PLAINTEXT = 8_000_000
+PAIRING_REMOVAL_SECONDS = 20
 
 
 def customer_controls(snapshot: dict, pc_id: str) -> dict[str, bool]:
@@ -87,6 +89,7 @@ class Runtime:
         self.retainer_clocks: dict[str, tuple[float, float]] = {}
         self.customer_auth_failures: dict[tuple[str, str], tuple[int, float]] = {}
         self.retainer_unlock_pending = False
+        self.pairing_removal: dict | None = None
 
     def start(self) -> None:
         self.network.start()
@@ -514,6 +517,75 @@ class Runtime:
         if not self.admin_ui_open or self.admin_signing_key is None:
             raise PermissionError("Authenticated Admin staff access is required.")
 
+    def _pairing_removal_active(self) -> bool:
+        if self.store.local("pending_pairing_revocation"):
+            return True
+        removal = self.pairing_removal
+        if removal and removal.get("expires_at", 0) <= time.time():
+            self.pairing_removal = None
+            removal = None
+        return removal is not None
+
+    def _require_pairing_available(self) -> None:
+        if self._pairing_removal_active():
+            raise RuntimeError(
+                "This computer is being removed from the cafe; new access "
+                "cannot start.")
+
+    def receive_pairing_revocation(self, notice: dict) -> bool:
+        """Apply only an Admin-signed revocation for this exact authorization."""
+        snap = self.snapshot()
+        if not snap:
+            return False
+        member = snap.get("members", {}).get(self.store.pc_id)
+        if not member:
+            return False
+        certificate = verify_pairing_revocation(
+            snap, notice, self.store.pc_id, member.get("public_key"),
+            member.get("authorization_id"))
+        saved_notice = json.dumps(notice, separators=(",", ":"))
+        first_notice = self.store.local(
+            "pending_pairing_revocation") != saved_notice
+        self.store.set_local("pending_pairing_revocation", saved_notice)
+        self.pairing_removal = {
+            "revocation_id": certificate["revocation_id"],
+            "expires_at": float("inf"),
+        }
+        if (snap.get("sessions", {}).get(self.store.pc_id)
+                or self.store.local_customer_session()
+                or self.retainer_unlock_pending):
+            if first_notice:
+                self.notify("pairing_revocation_pending", {
+                    "pc_name": certificate["pc_name"]})
+            return False
+        pool_id = snap["pool_id"]
+        cafe_name = snap.get("cafe_name", "the cafe")
+        if not self.store.clear_pairing_authorization(pool_id):
+            return False
+        self.admin_signing_key = None
+        self.admin_ui_open = False
+        self.pairing_removal = None
+        self.handoff_transfer = None
+        self.handoff_until = 0
+        self.last_access_allowed = None
+        with self.lock:
+            self.peer_statuses.clear()
+            self.connection_states.clear()
+            self.graceful_disconnects.clear()
+        self.notify("pairing_revoked", {"cafe_name": cafe_name})
+        return True
+
+    def _apply_pending_pairing_revocation(self) -> bool:
+        raw = self.store.local("pending_pairing_revocation")
+        if not raw:
+            return False
+        try:
+            notice = json.loads(raw)
+        except (TypeError, ValueError):
+            self.store.delete_local("pending_pairing_revocation")
+            return False
+        return self.receive_pairing_revocation(notice)
+
     def customer_admin_state(self, search: str = "",
                              selected_id: str = "") -> dict:
         self._require_customer_admin()
@@ -860,6 +932,7 @@ class Runtime:
 
     def login_customer(self, customer_id: str, password: str,
                        operation_id: str) -> dict:
+        self._require_pairing_available()
         if self.store.local_customer_session():
             raise RuntimeError("A registered customer is already logged in.")
         snap = self.snapshot()
@@ -909,6 +982,7 @@ class Runtime:
         self._reconcile_local_access()
 
     def start_local_retainer(self, operation_id: str) -> dict:
+        self._require_pairing_available()
         local = self.store.local_customer_session()
         if not local:
             raise PermissionError("Log in to a registered customer account first.")
@@ -1099,6 +1173,7 @@ class Runtime:
 
     def take_admin(self, password: str) -> None:
         """Authenticate, then log in locally or use the existing live handoff."""
+        self._require_pairing_available()
         live_admin = self._find_live_admin()
         snap = self.snapshot()
         if not snap or not verify_password(password, snap["admin_password"]):
@@ -1341,6 +1416,7 @@ class Runtime:
 
     def login_admin(self, password: str) -> None:
         """Password check followed by a first-available LAN Admin claim."""
+        self._require_pairing_available()
         snap = self.snapshot()
         if not snap or not verify_password(password, snap["admin_password"]):
             raise PermissionError("Incorrect Admin password.")
@@ -1585,6 +1661,130 @@ class Runtime:
             self._apply_session_command(signed, pc_id)
             return self.snapshot()
 
+    def _send_pairing_revocation(self, ip: str, snapshot: dict,
+                                 secret: str, notice: dict) -> dict:
+        """Deliver while both PCs can still authenticate the old membership."""
+        return authenticated_call(
+            ip, self.store.pc_id, snapshot, secret, "pairing_revoked",
+            {"revocation": notice}, self.store.node_private_key())
+
+    def remove_computer(self, pc_id: str) -> dict:
+        """Revoke one idle User PC without deleting its historical records."""
+        prepared_ip = ""
+        notice: dict | None = None
+        old_snapshot: dict | None = None
+        secret = ""
+        with self.lock:
+            self._require_customer_admin()
+            snap = self.snapshot()
+            existing = snap.get("revocations", {}).get(pc_id)
+            if pc_id not in snap["members"]:
+                if existing:
+                    return {"removed": True, "already_removed": True,
+                            "pc_id": pc_id,
+                            "pc_name": existing["certificate"]["pc_name"]}
+                raise ValueError("Choose a registered User PC.")
+            if pc_id == snap["active_admin"].get("pc_id"):
+                raise ValueError("The active Admin PC cannot be removed.")
+            member = dict(snap["members"][pc_id])
+            if snap["sessions"].get(pc_id):
+                raise RuntimeError(
+                    "End this PC's active gaming session before removing it.")
+            if self.store.customer_ownership(pc_id=pc_id):
+                raise RuntimeError(
+                    "Log out the registered customer on this PC before removing it.")
+            pending_key = f"pending_session_command:{snap['pool_id']}:{pc_id}"
+            if self.store.local(pending_key):
+                raise RuntimeError(
+                    "A session change is still pending for this PC. Retry or "
+                    "resolve it before removal.")
+
+            certificate = {
+                "version": 1, "pool_id": snap["pool_id"], "pc_id": pc_id,
+                "pc_name": member["name"],
+                "public_key": member["public_key"],
+                "authorization_id": member["authorization_id"],
+                "revocation_id": uuid.uuid4().hex,
+                "revision": int(snap["revision"]) + 1,
+                "revoked_at": time.time(), "removed_by": self.store.pc_id,
+            }
+            notice = {
+                "certificate": certificate,
+                "signing_public": snap["admin_signing"]["public"],
+                "signature": sign_admin_proof(
+                    self.admin_signing_key, certificate),
+            }
+            verify_pairing_revocation(
+                snap, notice, pc_id, member["public_key"],
+                member["authorization_id"])
+
+            peer = next((item for item in self.store.peers()
+                         if item["pc_id"] == pc_id), None)
+            if peer and self.peer_status(pc_id):
+                reply = self.network.call(peer["ip"],
+                                          "prepare_pairing_removal",
+                                          {"revocation": notice})
+                if (reply.get("target") != pc_id
+                        or not reply.get("ready")):
+                    raise RuntimeError(
+                        "Target PC did not confirm it is safe to remove.")
+                prepared_ip = peer["ip"]
+
+            try:
+                # Recheck the authoritative state after the remote idle guard.
+                snap = self.snapshot()
+                if (snap["sessions"].get(pc_id)
+                        or self.store.customer_ownership(pc_id=pc_id)
+                        or self.store.local(pending_key)):
+                    raise RuntimeError(
+                        "The PC's session state changed during removal. Try again "
+                        "after it is idle.")
+                old_snapshot = snap
+                secret = self.store.secret() or ""
+
+                def revoke(state):
+                    current = state["members"].get(pc_id)
+                    if current is None:
+                        return
+                    if (current.get("public_key") != member["public_key"]
+                            or current.get("authorization_id") !=
+                            member["authorization_id"]):
+                        raise RuntimeError(
+                            "The PC pairing changed during removal. Refresh and retry.")
+                    state["members"].pop(pc_id)
+                    state["sessions"].pop(pc_id, None)
+                    state["unlock_requests"].pop(pc_id, None)
+                    state.setdefault("revocations", {})[pc_id] = notice
+
+                updated = self.store.update(revoke)
+            except Exception:
+                if prepared_ip:
+                    try:
+                        self.network.call(
+                            prepared_ip, "cancel_pairing_removal",
+                            {"revocation_id": certificate["revocation_id"]})
+                    except Exception:
+                        pass
+                raise
+
+        self.store.forget_peer(pc_id)
+        with self.lock:
+            self.peer_statuses.pop(pc_id, None)
+            self.connection_states.pop(pc_id, None)
+            self.graceful_disconnects.discard(pc_id)
+        if prepared_ip and old_snapshot:
+            try:
+                self._send_pairing_revocation(
+                    prepared_ip, old_snapshot, secret, notice)
+            except Exception:
+                # The durable certificate is returned when the old PC retries.
+                pass
+        self.notify("changed")
+        self._replicate_once()
+        return {"removed": True, "already_removed": False,
+                "pc_id": pc_id, "pc_name": member["name"],
+                "revision": updated["revision"]}
+
     def remote_exit(self, pc_id: str) -> dict:
         self._require_admin()
         snap = self.snapshot()
@@ -1640,6 +1840,7 @@ class Runtime:
         with self.lock:
             if self.local_shutdown_pending:
                 raise RuntimeError("This PC is closing; session changes are unavailable.")
+            self._require_pairing_available()
             snap = self.snapshot()
             session, history, grants = self._owner_payload()
             if any(item["command"]["id"] == operation_id for item in grants):
@@ -1707,6 +1908,9 @@ class Runtime:
         with self.lock:
             if self.local_shutdown_pending:
                 raise RuntimeError("This PC is closing; session changes are unavailable.")
+            if data.get("command", {}).get("action") in (
+                    "start", "add", "pause", "resume"):
+                self._require_pairing_available()
             snap = self.snapshot()
             command = data["command"]
             claim = snap["active_admin"]
@@ -1846,6 +2050,8 @@ class Runtime:
                         if item["request_id"] == request_id and item["pc_id"] == pc_id), None)
         if not pending:
             raise ValueError("Join request is no longer pending.")
+        if pc_id in self.snapshot()["members"]:
+            raise ValueError("This computer is already registered.")
         shared = bytes.fromhex(self.store.verify_join_code(
             request_id, pc_id, verification_code.strip()
         ))
@@ -1854,6 +2060,7 @@ class Runtime:
             raise ValueError("PC name must be 1 to 40 characters.")
         updated = self.change(lambda state: state["members"].update(
             {pc_id: {"name": name, "public_key": pending["public_key"],
+                     "authorization_id": secrets.token_hex(32),
                      "last_connected_at": time.time()}}
         ))
         welcome = {"snapshot": updated, "secret": self.store.secret(),
@@ -1888,6 +2095,71 @@ class Runtime:
             return {"recorded": True}
         if operation == "session_command":
             return self._apply_session_command(data, sender)
+        if operation == "prepare_pairing_removal":
+            with self.lock:
+                snap = self.snapshot()
+                claim = snap["active_admin"]
+                member = snap["members"].get(self.store.pc_id)
+                notice = data.get("revocation")
+                if (sender != claim.get("pc_id")
+                        or claim.get("expires_at", 0) <= time.time()
+                        or not member):
+                    raise PermissionError(
+                        "Only the active Admin can prepare a PC removal.")
+                certificate = verify_pairing_revocation(
+                    snap, notice, self.store.pc_id,
+                    member.get("public_key"),
+                    member.get("authorization_id"))
+                if certificate.get("removed_by") != sender:
+                    raise PermissionError(
+                        "Pairing removal was not issued by the active Admin.")
+                existing = self.pairing_removal
+                if (existing and existing.get("revocation_id") !=
+                        certificate["revocation_id"]
+                        and existing.get("expires_at", 0) > time.time()):
+                    raise RuntimeError("Another pairing removal is in progress.")
+                if (snap["sessions"].get(self.store.pc_id)
+                        or self.store.local_customer_session()
+                        or self.retainer_unlock_pending
+                        or self.local_shutdown_pending):
+                    raise RuntimeError(
+                        "This PC has active gameplay or a pending transition.")
+                self.pairing_removal = {
+                    "revocation_id": certificate["revocation_id"],
+                    "expires_at": time.time() + PAIRING_REMOVAL_SECONDS,
+                }
+                return {"ready": True, "target": self.store.pc_id}
+        if operation == "cancel_pairing_removal":
+            claim = snap["active_admin"]
+            if (sender != claim.get("pc_id")
+                    or claim.get("expires_at", 0) <= time.time()):
+                raise PermissionError(
+                    "Only the active Admin can cancel a PC removal.")
+            removal = self.pairing_removal
+            if (removal and removal.get("revocation_id") ==
+                    data.get("revocation_id")):
+                self.pairing_removal = None
+            return {"cancelled": True, "target": self.store.pc_id}
+        if operation == "pairing_revoked":
+            claim = snap["active_admin"]
+            member = snap["members"].get(self.store.pc_id)
+            if (sender != claim.get("pc_id")
+                    or claim.get("expires_at", 0) <= time.time()
+                    or not member):
+                raise PermissionError(
+                    "Only the active Admin can revoke this pairing.")
+            certificate = verify_pairing_revocation(
+                snap, data.get("revocation"), self.store.pc_id,
+                member.get("public_key"), member.get("authorization_id"))
+            if certificate.get("removed_by") != sender:
+                raise PermissionError(
+                    "Pairing removal was not issued by the active Admin.")
+            if (snap["sessions"].get(self.store.pc_id)
+                    or self.store.local_customer_session()
+                    or self.retainer_unlock_pending):
+                raise RuntimeError(
+                    "Pairing removal cannot interrupt active gameplay.")
+            return {"accepted": True, "target": self.store.pc_id}
         if operation == "remote_exit":
             claim = snap["active_admin"]
             if (sender != claim.get("pc_id") or
@@ -2191,9 +2463,20 @@ class Runtime:
         found = discover()
         for item in found:
             if (item["pool_id"] == snap["pool_id"]
-                    and item["pc_id"] in snap["members"]
+                    and (item["pc_id"] in snap["members"]
+                         or item["pc_id"] == item.get("active_admin"))
                     and item["pc_id"] != self.store.pc_id):
                 self.store.remember_address(item["pc_id"], item["ip"])
+                if item["pc_id"] not in snap["members"]:
+                    try:
+                        # A stale removed PC may not know a later Admin Node,
+                        # but its signed old request can receive the durable
+                        # revocation certificate. Discovery alone grants nothing.
+                        self.network.call(item["ip"], "status", {})
+                    except Exception:
+                        pass
+                    if not self.store.current_pool_id:
+                        return found
         return found
 
     def _replicate_once(self) -> None:
@@ -2531,11 +2814,22 @@ class Runtime:
         last_renew = 0.0
         while not self.stop_event.is_set():
             try:
+                if self.store.local("pending_pairing_revocation"):
+                    if self._apply_pending_pairing_revocation():
+                        self.stop_event.wait(SYNC_INTERVAL_SECONDS)
+                        continue
+                if not self.store.current_pool_id:
+                    self.stop_event.wait(SYNC_INTERVAL_SECONDS)
+                    continue
                 if self.is_admin() and time.monotonic() - last_renew >= 5:
                     self._renew_admin_lease()
                     last_renew = time.monotonic()
                 self._discover_peers_once()
+                if not self.store.current_pool_id:
+                    continue
                 self._poll_peer_statuses()
+                if not self.store.current_pool_id:
+                    continue
                 self.update_admin_connection_note()
                 self._settle_admin_ownership()
                 self._tick_sessions()

@@ -18,14 +18,24 @@ from .customers import (DEFAULT_CUSTOMER_PASSWORD, MAX_RETAINER_SECONDS,
                         normalize_customer_name, validate_cooldown_minutes,
                         validate_customer_password)
 from .security import (create_admin_signing_record, create_node_keypair,
-                       node_public_from_private, sign_node, verify_node,
-                       verify_admin_proof)
+                       legacy_authorization_id, node_public_from_private,
+                       sign_node, verify_node, verify_admin_proof,
+                       verify_pairing_revocation)
 
 
 PASSWORD_ITERATIONS = 600_000
 HISTORY_PER_PC = 100
 NOTIFICATION_LIMIT = 100
 MAX_WALLPAPER_BYTES = 500_000
+
+
+def ensure_membership_fields(snapshot: dict) -> None:
+    """Add deterministic authorization generations to legacy snapshots."""
+    pool_id = str(snapshot.get("pool_id", ""))
+    snapshot.setdefault("revocations", {})
+    for pc_id, member in snapshot.get("members", {}).items():
+        member.setdefault("authorization_id", legacy_authorization_id(
+            pool_id, str(pc_id), str(member.get("public_key", ""))))
 
 
 def default_data_path() -> Path:
@@ -92,6 +102,7 @@ def new_pool(cafe_name: str, pc_id: str, pc_name: str,
         "admin_signing_keys": [signing["public"]],
         "members": {pc_id: {"name": pc_name.strip(),
                             "public_key": pc_public_key,
+                            "authorization_id": secrets.token_hex(32),
                             "last_connected_at": time.time()}},
         "settings": {"grace_minutes": 10, "auto_signout_enabled": False,
                      "auto_signout_minutes": 30,
@@ -103,6 +114,7 @@ def new_pool(cafe_name: str, pc_id: str, pc_name: str,
         "active_admin": {"pc_id": pc_id, "term": 1,
                          "expires_at": time.time() + 15, "proof": None},
         "unlock_requests": {},
+        "revocations": {},
     }
     return snapshot, secrets.token_hex(32)
 
@@ -313,6 +325,7 @@ class Store:
             settings.setdefault("retainer_restart_cooldown_minutes", 0)
             settings.setdefault("customer_login_cooldown_minutes", 0)
             snapshot.setdefault("wallpaper", None)
+            ensure_membership_fields(snapshot)
             self.prune_history(snapshot)
             for (payload_text,) in self.db.execute(
                     "SELECT payload FROM owner_records WHERE pool_id=?", (pool_id,)):
@@ -1361,6 +1374,25 @@ class Store:
                 or snapshot.get("active_admin", {}).get("pc_id") != source_admin
                 or candidate not in snapshot.get("members", {})):
             raise ValueError("Admin handoff snapshot is invalid.")
+        revocations = snapshot.get("revocations", {})
+        if not isinstance(revocations, dict):
+            raise ValueError("Admin handoff revocations are invalid.")
+        try:
+            for pc_id, notice in revocations.items():
+                certificate = verify_pairing_revocation(
+                    snapshot, notice, expected_pc_id=str(pc_id))
+                if int(certificate["revision"]) > int(snapshot["revision"]):
+                    raise ValueError(
+                        "Revocation revision is newer than the snapshot.")
+                active = snapshot.get("members", {}).get(str(pc_id))
+                if (active and active.get("public_key") ==
+                        certificate["public_key"]
+                        and active.get("authorization_id") ==
+                        certificate["authorization_id"]):
+                    raise ValueError(
+                        "An active membership still uses revoked authorization.")
+        except Exception as error:
+            raise ValueError("Admin handoff revocations are invalid.") from error
         for key in required - {"snapshot"}:
             if not isinstance(state[key], list) or len(state[key]) > 100_000:
                 raise ValueError("Admin handoff record set is invalid or too large.")
@@ -2007,6 +2039,7 @@ class Store:
             settings.setdefault("retainer_restart_cooldown_minutes", 0)
             settings.setdefault("customer_login_cooldown_minutes", 0)
             snapshot.setdefault("wallpaper", None)
+            ensure_membership_fields(snapshot)
             self.prune_history(snapshot)
             for (payload_text,) in self.db.execute(
                     "SELECT payload FROM owner_records WHERE pool_id=?",
@@ -2096,6 +2129,50 @@ class Store:
                 "INSERT INTO peers(pc_id,ip,last_seen) VALUES(?,?,0) "
                 "ON CONFLICT(pc_id) DO UPDATE SET ip=excluded.ip", (pc_id, ip)
             )
+
+    def forget_peer(self, pc_id: str) -> None:
+        """Drop connection and customer-sync metadata for one removed member."""
+        pool_id = self.current_pool_id
+        with self._lock, self.db:
+            self.db.execute("DELETE FROM peers WHERE pc_id=?", (pc_id,))
+            if pool_id:
+                self.db.execute(
+                    "DELETE FROM customer_sync_acks WHERE pool_id=? AND pc_id=?",
+                    (pool_id, pc_id))
+                self.db.execute(
+                    "DELETE FROM customer_sync_state WHERE pool_id=? AND pc_id=?",
+                    (pool_id, pc_id))
+
+    def clear_pairing_authorization(self, pool_id: str) -> bool:
+        """Forget one revoked membership while retaining this installation ID."""
+        if not pool_id or self.current_pool_id != pool_id:
+            return False
+        with self._lock, self.db:
+            for table in (
+                    "customer_adjustments", "customer_operations",
+                    "customer_ownership", "retainer_sessions",
+                    "customer_accounts", "customer_tombstones",
+                    "customer_sync_acks", "customer_sync_state",
+                    "recovery_checkpoints", "wallpapers",
+                    "admin_notifications"):
+                self.db.execute(
+                    f"DELETE FROM {table} WHERE pool_id=?", (pool_id,))
+            # Owner records contain only signed session/history data. Retaining
+            # them lets a freshly approved re-pair preserve this PC's audit trail.
+            self.db.execute("DELETE FROM pools WHERE pool_id=?", (pool_id,))
+            self.db.execute("DELETE FROM peers")
+            self.db.execute("DELETE FROM pending_joins")
+            self.db.execute("DELETE FROM local_commands")
+            self.db.execute("DELETE FROM local WHERE key='current_pool_id'")
+            self.db.execute(
+                "DELETE FROM local WHERE key IN "
+                "('admin_connection_note','customer_admin_online',"
+                "'customer_feedback','locked_console_notice',"
+                "'pending_pairing_revocation')")
+            self.db.execute(
+                "DELETE FROM local WHERE key LIKE ? OR key LIKE ?",
+                (f"%:{pool_id}", f"pending_session_command:{pool_id}:%"))
+        return True
 
     def record_join(self, request_id: str, pc_id: str, name: str,
                     ip: str, public_key: str, pairing_public: str,

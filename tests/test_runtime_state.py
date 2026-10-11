@@ -284,7 +284,9 @@ class RuntimeStateTest(unittest.TestCase):
         request = signed(self.user_store.secret(), self.admin_store.pc_id,
                          snapshot["pool_id"], "remote_exit",
                          {"term": snapshot["active_admin"]["term"]},
-                         self.admin_store.node_private_key())
+                         self.admin_store.node_private_key(),
+                         snapshot["members"][self.admin_store.pc_id][
+                             "authorization_id"])
         replies = []
 
         def capture_reply(connection, response):
@@ -303,7 +305,9 @@ class RuntimeStateTest(unittest.TestCase):
         request = signed(self.user_store.secret(), self.admin_store.pc_id,
                          snapshot["pool_id"], "remote_exit",
                          {"term": snapshot["active_admin"]["term"]},
-                         self.admin_store.node_private_key())
+                         self.admin_store.node_private_key(),
+                         snapshot["members"][self.admin_store.pc_id][
+                             "authorization_id"])
         with patch("game_cafe.network.read_message", return_value=request), \
              patch("game_cafe.network.send_message", side_effect=OSError("disconnected")):
             self.user.network._serve_one(MagicMock(), "admin")

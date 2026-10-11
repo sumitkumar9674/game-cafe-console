@@ -334,6 +334,8 @@ class CafeBridge(QObject):
             if self.store.current_pool_id:
                 live = self.runtime.verified_admin_online()
                 snapshot = self.store.snapshot()
+                if not snapshot:
+                    return "onboarding", discover(timeout=1.5), {}, {}
                 return ("candidate", [], self._branding(snapshot),
                         self._admin_login_state(snapshot, live))
             return "onboarding", discover(timeout=1.5), {}, {}
@@ -467,6 +469,44 @@ class CafeBridge(QObject):
             self._set_mode("widget")
             self.refresh()
         self._submit("user_window", self.host.start_console, done, blocking=True)
+
+    def _enter_unpaired(self, value: dict | None = None) -> None:
+        """Restore the normal desktop, then show the existing pairing screen."""
+        if self._shutting_down:
+            return
+        if self._busy or self.host.console_transitioning:
+            QTimer.singleShot(250, lambda: self._enter_unpaired(value))
+            return
+        self.runtime.admin_ui_open = False
+        self.runtime.admin_signing_key = None
+        self._selected_pc = ""
+        self._expanded_pc = ""
+        self.selectionChanged.emit()
+        self._set_status("This computer is no longer paired")
+        self._set_mode("splash")
+        self.host.console_transitioning = True
+
+        def work():
+            self.host.stop_console()
+            return discover(timeout=1.5)
+
+        def done(found, error):
+            self.host.console_transitioning = False
+            self._set_view(
+                cafeName="GameGrid", hasAvatar=False, avatarSource="",
+                pools=self._distinct_pools(found or []),
+                activeAdminDetected=False, adminNode=False, adminOnline=False)
+            self._set_mode("onboarding")
+            cafe = str((value or {}).get("cafe_name", "the cafe"))
+            message = (
+                f"This computer was removed from {cafe}. Pair it again and "
+                "obtain Admin approval before reconnecting."
+            )
+            if error:
+                message += f" Cafe discovery is temporarily unavailable: {error}"
+            self._show_notice("Computer removed", message)
+
+        self._submit("pairing_revoked", work, done, blocking=True)
 
     def _return_to_login(self) -> None:
         if self._busy or self.host.console_transitioning:
@@ -793,6 +833,10 @@ class CafeBridge(QObject):
                        "ip": item["ip"], "attempts": item["attempts"]}
                       for item in pending],
             "members": [{"pcId": pc_id, "name": member["name"],
+                         "isAdmin": pc_id == admin_id,
+                         "canRemove": bool(
+                             self.runtime and self.runtime.is_admin()
+                             and pc_id != admin_id),
                          "online": pc_id == own or
                          (self.runtime.peer_status(pc_id) is not None if self.runtime else False),
                          "ip": peers.get(pc_id, {}).get("ip", "")}
@@ -1188,6 +1232,35 @@ class CafeBridge(QObject):
     def renamePc(self, pc_id: str, name: str) -> None:
         self._action("rename_pc", lambda: self.runtime.admin_action(
             "rename_pc", pc_id, name=name))
+
+    @Slot(str)
+    def removeComputer(self, pc_id: str) -> None:
+        target = next((item for item in self.member_model.rows
+                       if item["pcId"] == pc_id), None)
+        if not target or not target.get("canRemove"):
+            self._show_notice(
+                "Cannot remove computer",
+                "Choose an eligible registered User PC.", True)
+            return
+
+        def done(result, error):
+            if error:
+                self._show_notice("Computer not removed", str(error), True)
+            else:
+                if self._selected_pc == pc_id:
+                    self._selected_pc = ""
+                if self._expanded_pc == pc_id:
+                    self._expanded_pc = ""
+                self.selectionChanged.emit()
+                self._show_notice(
+                    "Computer removed",
+                    f"{result['pc_name']} ({pc_id}) must be paired again "
+                    "before it can reconnect.")
+            self.refresh()
+
+        self._submit(
+            "remove_computer", lambda: self.runtime.remove_computer(pc_id),
+            done, blocking=True)
 
     @Slot(str)
     def clearHistory(self, pc_id: str) -> None:
@@ -1766,6 +1839,17 @@ class CafeBridge(QObject):
                     print(f"Game Cafe Console: {value}")
                 elif kind == "remote_exit":
                     self.host.shutdown(source="remote_exit")
+                elif kind == "pairing_revoked":
+                    self._enter_unpaired(value if isinstance(value, dict) else {})
+                elif kind == "pairing_revocation_pending":
+                    self._show_notice(
+                        "Computer removal pending",
+                        "This computer was removed from the cafe. Its active "
+                        "session will not be interrupted; pairing will be "
+                        "cleared after the session ends.")
+            if (not self.store.current_pool_id
+                    and self._mode not in ("onboarding", "joining", "splash")):
+                self._enter_unpaired({})
             if self._mode == "admin" and not self.runtime.is_admin():
                 self._enter_user()
         except Exception as error:

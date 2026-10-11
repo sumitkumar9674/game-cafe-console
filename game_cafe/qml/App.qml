@@ -147,6 +147,7 @@ ApplicationWindow {
                         text: root.notice.title ? "OK" : root.confirmation.label || "Confirm"
                         danger: !!root.notice.error || root.confirmation.label === "Exit Application"
                                 || root.confirmation.label === "Delete User"
+                                || root.confirmation.label === "Remove Computer"
                                 || root.confirmation.label === "End Session"
                         enabled: !root.confirmation.requiredText
                                  || root.confirmationInput === root.confirmation.requiredText

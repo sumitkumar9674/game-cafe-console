@@ -13,7 +13,8 @@ import uuid
 
 from .storage import Store
 from .lifecycle import lifecycle_event
-from .security import sign_node, verify_node
+from .security import (sign_node, verify_node,
+                       verify_pairing_revocation)
 
 
 PROTOCOL = "GAME_CAFE/1"
@@ -22,6 +23,14 @@ COMMAND_PORT = 48121
 MAX_MESSAGE = 1_000_000
 TIMEOUT = 2.5
 REPLAY_WINDOW = 30
+
+
+class PairingRevokedError(PermissionError):
+    """A valid Admin certificate revoked this PC's saved authorization."""
+
+    def __init__(self, notice: dict):
+        super().__init__("This computer's cafe pairing was removed by the Admin.")
+        self.notice = notice
 
 
 def compact(data: dict) -> bytes:
@@ -52,12 +61,15 @@ def read_message(connection: socket.socket) -> dict:
 
 def signed(secret_hex: str, sender: str, pool_id: str,
            operation: str, data: dict,
-           private_key: str | None = None) -> dict:
+           private_key: str | None = None,
+           authorization_id: str | None = None) -> dict:
     message = {
         "protocol": PROTOCOL, "pool_id": pool_id, "sender": sender,
         "operation": operation, "data": data, "timestamp": time.time(),
         "nonce": uuid.uuid4().hex,
     }
+    if authorization_id:
+        message["authorization_id"] = authorization_id
     if private_key:
         message["signature"] = sign_node(private_key, message)
     message["mac"] = hmac.new(bytes.fromhex(secret_hex), compact(message),
@@ -71,6 +83,11 @@ def verify_signed(message: dict, secret_hex: str, members: dict,
         raise ValueError("Unsupported protocol.")
     if message.get("sender") not in members:
         raise PermissionError("Sender is not registered in this pool.")
+    member = members[message["sender"]]
+    expected_authorization = member.get("authorization_id")
+    if (expected_authorization is not None
+            and message.get("authorization_id") != expected_authorization):
+        raise PermissionError("Pairing authorization is no longer valid.")
     timestamp = float(message.get("timestamp", 0))
     if abs(time.time() - timestamp) > REPLAY_WINDOW:
         raise PermissionError("Request expired or system clocks differ.")
@@ -82,7 +99,7 @@ def verify_signed(message: dict, secret_hex: str, members: dict,
                         hashlib.sha256).hexdigest()
     if not hmac.compare_digest(expected, str(message.get("mac", ""))):
         raise PermissionError("Invalid message authentication code.")
-    public_key = members[message["sender"]].get("public_key")
+    public_key = member.get("public_key")
     if public_key:
         if not isinstance(message.get("signature"), str):
             raise PermissionError("Missing PC identity signature.")
@@ -175,11 +192,19 @@ def authenticated_call(ip: str, sender: str, snapshot: dict,
                        private_key: str | None = None) -> dict:
     """Use a candidate pool during join, before switching local membership."""
     request = signed(secret, sender, snapshot["pool_id"], operation, data,
-                     private_key)
+                     private_key, snapshot["members"].get(
+                         sender, {}).get("authorization_id"))
     with socket.create_connection((ip, COMMAND_PORT), TIMEOUT) as connection:
         connection.settimeout(TIMEOUT)
         send_message(connection, request)
         response = read_message(connection)
+    revocation = response.get("revocation")
+    if revocation is not None:
+        member = snapshot["members"].get(sender, {})
+        verify_pairing_revocation(
+            snapshot, revocation, sender, member.get("public_key"),
+            member.get("authorization_id"))
+        raise PairingRevokedError(revocation)
     verify_signed(response, secret, snapshot["members"])
     body = response.get("data", {})
     if response.get("operation") != "response" or body.get("for") != request["nonce"]:
@@ -269,8 +294,13 @@ class NodeNetwork:
         secret = self.store.secret()
         if not snapshot or not secret:
             raise RuntimeError("This PC has not joined a cafe.")
-        return authenticated_call(ip, self.store.pc_id, snapshot, secret,
-                                  operation, data, self.store.node_private_key())
+        try:
+            return authenticated_call(
+                ip, self.store.pc_id, snapshot, secret, operation, data,
+                self.store.node_private_key())
+        except PairingRevokedError as error:
+            self.runtime.receive_pairing_revocation(error.notice)
+            raise
 
     def _udp_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -323,8 +353,38 @@ class NodeNetwork:
                 secret = self.store.secret()
                 if not snapshot or not secret or request.get("pool_id") != snapshot["pool_id"]:
                     raise PermissionError("Unknown cafe pool.")
-                with self.nonce_lock:
-                    verify_signed(request, secret, snapshot["members"], self.seen_nonces)
+                try:
+                    with self.nonce_lock:
+                        verify_signed(
+                            request, secret, snapshot["members"],
+                            self.seen_nonces)
+                except Exception as member_error:
+                    notice = snapshot.get("revocations", {}).get(
+                        str(request.get("sender", "")))
+                    if notice:
+                        certificate = verify_pairing_revocation(
+                            snapshot, notice,
+                            str(request.get("sender", "")))
+                        revoked_member = {
+                            "public_key": certificate["public_key"],
+                            "authorization_id": certificate[
+                                "authorization_id"],
+                        }
+                        try:
+                            with self.nonce_lock:
+                                verify_signed(
+                                    request, secret,
+                                    {certificate["pc_id"]: revoked_member},
+                                    self.seen_nonces)
+                        except Exception:
+                            raise member_error
+                        send_message(connection, {
+                            "ok": False,
+                            "error": "Pairing authorization was revoked.",
+                            "revocation": notice,
+                        })
+                        return
+                    raise
                 self.store.note_peer(request["sender"], ip)
                 try:
                     result = self.runtime.handle_member(
@@ -336,11 +396,18 @@ class NodeNetwork:
                             "error": str(error)}
                 response = signed(secret, self.store.pc_id, snapshot["pool_id"],
                                   "response", body,
-                                  self.store.node_private_key())
+                                  self.store.node_private_key(),
+                                  snapshot["members"].get(
+                                      self.store.pc_id, {}).get(
+                                          "authorization_id"))
                 send_message(connection, response)
                 if operation == "remote_exit" and body["ok"] and result.get("accepted"):
                     # Exit only after the acknowledgement has been sent.
                     self.runtime.notify("remote_exit")
+                if (operation == "pairing_revoked" and body["ok"]
+                        and result.get("accepted")):
+                    self.runtime.receive_pairing_revocation(
+                        request.get("data", {}).get("revocation"))
             except Exception as error:
                 try:
                     send_message(connection, {"ok": False, "error": str(error)})

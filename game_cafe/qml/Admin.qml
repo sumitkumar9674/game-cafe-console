@@ -700,12 +700,26 @@ Item {
                     }
                 }
                 Repeater { model: bridge.memberModel
-                    Panel { required property var rowData; Layout.fillWidth: true; implicitHeight: 72
+                    Panel { required property var rowData; Layout.fillWidth: true; implicitHeight: 78
                         RowLayout { anchors.fill: parent; anchors.margins: 12
                             Text { text: rowData.online ? "●" : "○"; color: rowData.online ? "#64BCC1" : "#A8B8CA" }
-                            Text { text: rowData.name; color: "#F4F7FB"; Layout.fillWidth: true }
+                            ColumnLayout { Layout.fillWidth: true; spacing: 2
+                                Text { text: rowData.name + (rowData.isAdmin ? "  ·  Admin" : ""); color: "#F4F7FB"; font.bold: true }
+                                Text { text: rowData.pcId; color: "#8398AC"; font.pixelSize: 10 }
+                            }
                             TextField { id: newName; placeholderText: "Rename PC"; Layout.preferredWidth: 170 }
                             ActionButton { text: "Save name"; secondary: true; onClicked: bridge.renamePc(rowData.pcId,newName.text) }
+                            ActionButton {
+                                objectName: "removeComputerButton"
+                                text: "Remove Computer"
+                                danger: true
+                                visible: rowData.canRemove
+                                onClicked: root.ask(
+                                    "Remove Computer?",
+                                    "Remove " + rowData.name + " (ID: " + rowData.pcId + ") from this cafe? This revokes its current pairing. It must complete Admin-approved pairing again before reconnecting.",
+                                    "Remove Computer",
+                                    function() { bridge.removeComputer(rowData.pcId) })
+                            }
                         }
                     }
                 }

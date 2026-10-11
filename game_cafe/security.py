@@ -69,6 +69,71 @@ def verify_admin_proof(public_hex: str, payload: dict, signature_hex: str) -> No
     public.verify(bytes.fromhex(signature_hex), canonical)
 
 
+def legacy_authorization_id(pool_id: str, pc_id: str,
+                            public_key: str) -> str:
+    """Derive one stable generation for member records created before revocation."""
+    value = f"GameGrid legacy membership:{pool_id}:{pc_id}:{public_key}"
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def verify_pairing_revocation(snapshot: dict, notice: dict,
+                              expected_pc_id: str | None = None,
+                              expected_public_key: str | None = None,
+                              expected_authorization_id: str | None = None
+                              ) -> dict:
+    """Verify an Admin-signed, identity-bound membership revocation."""
+    if not isinstance(notice, dict):
+        raise PermissionError("Invalid pairing revocation notice.")
+    certificate = notice.get("certificate")
+    signing_public = notice.get("signing_public")
+    signature = notice.get("signature")
+    required = {
+        "version", "pool_id", "pc_id", "pc_name", "public_key",
+        "authorization_id", "revocation_id", "revision", "revoked_at",
+        "removed_by",
+    }
+    if (not isinstance(certificate, dict) or set(certificate) != required
+            or certificate.get("version") != 1
+            or certificate.get("pool_id") != snapshot.get("pool_id")
+            or not isinstance(signing_public, str)
+            or not isinstance(signature, str)):
+        raise PermissionError("Invalid pairing revocation notice.")
+    trusted = {
+        snapshot.get("admin_signing", {}).get("public"),
+        *snapshot.get("admin_signing_keys", []),
+    }
+    if signing_public not in trusted:
+        raise PermissionError("Pairing revocation signer is not trusted.")
+    if (expected_pc_id is not None
+            and certificate.get("pc_id") != expected_pc_id):
+        raise PermissionError("Pairing revocation targets another PC.")
+    if (expected_public_key is not None
+            and certificate.get("public_key") != expected_public_key):
+        raise PermissionError("Pairing revocation targets another PC identity.")
+    if (expected_authorization_id is not None
+            and certificate.get("authorization_id") !=
+            expected_authorization_id):
+        raise PermissionError("Pairing revocation is for an older authorization.")
+    try:
+        invalid = (not certificate.get("pc_id")
+                   or not certificate.get("public_key")
+                   or not certificate.get("authorization_id")
+                   or not certificate.get("revocation_id")
+                   or int(certificate.get("revision", 0)) < 1
+                   or float(certificate.get("revoked_at", 0)) <= 0)
+    except (TypeError, ValueError) as error:
+        raise PermissionError(
+            "Invalid pairing revocation certificate.") from error
+    if invalid:
+        raise PermissionError("Invalid pairing revocation certificate.")
+    try:
+        verify_admin_proof(signing_public, certificate, signature)
+    except Exception as error:
+        raise PermissionError(
+            "Pairing revocation signature is invalid.") from error
+    return certificate
+
+
 def create_node_keypair() -> tuple[str, str]:
     """Return a private/public Ed25519 pair; only the public half is shared."""
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey

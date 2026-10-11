@@ -15,15 +15,20 @@ ApplicationWindow {
     Material.theme: Material.Dark
     Material.accent: "#D85288"
     property var confirmation: ({})
+    property string confirmationInput: ""
     property var notice: bridge.notice
-    function ask(title, message, label, action, cancelLabel, cancelAction) {
+    function ask(title, message, label, action, cancelLabel, cancelAction,
+                 requiredText, showCloseControl) {
+        confirmationInput = ""
         confirmation = ({ title: title, message: message, label: label,
                           action: action, cancelLabel: cancelLabel || "Cancel",
-                          cancelAction: cancelAction })
+                          cancelAction: cancelAction,
+                          requiredText: requiredText || "",
+                          showCloseControl: !!showCloseControl })
     }
     function confirmAdminExit() {
         ask("Exit GameGrid",
-            "Exiting disconnects this Admin PC. Existing sessions on other User PCs will continue independently.",
+            bridge.adminExitMessage(),
             "Exit Application", function() { bridge.closeAdmin() })
     }
     function confirmAdminSignOut() {
@@ -52,11 +57,16 @@ ApplicationWindow {
             return
         }
         confirmation = ({})
+        confirmationInput = ""
     }
     function acceptConfirmation() {
+        if (confirmation.requiredText &&
+                confirmationInput !== confirmation.requiredText) return
         let action = confirmation.action
+        let input = confirmationInput
         confirmation = ({})
-        if (action) action()
+        confirmationInput = ""
+        if (action) action(input)
     }
     onClosing: function(close) {
         close.accepted = false
@@ -65,6 +75,10 @@ ApplicationWindow {
             if (root.notice.title) bridge.clearNotice()
             confirmAdminExit()
         } else if (bridge.mode === "widget") {
+            if (root.confirmation.title) {
+                root.cancelConfirmation()
+                return
+            }
             root.showMinimized()
         } else {
             bridge.closeApplication()
@@ -101,15 +115,41 @@ ApplicationWindow {
                 anchors.fill: parent
                 anchors.margins: 24
                 spacing: 18
-                Text { text: root.notice.title || root.confirmation.title || ""; color: "#F4F7FB"; font.pixelSize: 22; font.bold: true; Layout.fillWidth: true; wrapMode: Text.WordWrap }
+                RowLayout {
+                    Layout.fillWidth: true
+                    Text { text: root.notice.title || root.confirmation.title || ""; color: "#F4F7FB"; font.pixelSize: 22; font.bold: true; Layout.fillWidth: true; wrapMode: Text.WordWrap }
+                    ActionButton {
+                        objectName: "confirmationCloseButton"
+                        text: "×"
+                        secondary: true
+                        Layout.preferredWidth: 42
+                        Accessible.name: "Close confirmation"
+                        visible: !root.notice.title
+                                 && !!root.confirmation.showCloseControl
+                        onClicked: root.cancelConfirmation()
+                    }
+                }
                 Text { text: root.notice.message || root.confirmation.message || ""; color: "#A8B8CA"; font.pixelSize: 14; Layout.fillWidth: true; wrapMode: Text.WordWrap }
+                TextField {
+                    objectName: "confirmationExactNameInput"
+                    visible: !root.notice.title && !!root.confirmation.requiredText
+                    Layout.fillWidth: true
+                    placeholderText: "Enter the exact customer name"
+                    text: root.confirmationInput
+                    onTextChanged: root.confirmationInput = text
+                }
                 RowLayout {
                     Layout.alignment: Qt.AlignRight
                     spacing: 10
                     ActionButton { objectName: "confirmationCancelButton"; text: root.confirmation.cancelLabel || "Cancel"; secondary: true; visible: !root.notice.title; onClicked: root.cancelConfirmation() }
                     ActionButton {
+                        objectName: "confirmationAcceptButton"
                         text: root.notice.title ? "OK" : root.confirmation.label || "Confirm"
                         danger: !!root.notice.error || root.confirmation.label === "Exit Application"
+                                || root.confirmation.label === "Delete User"
+                                || root.confirmation.label === "End Session"
+                        enabled: !root.confirmation.requiredText
+                                 || root.confirmationInput === root.confirmation.requiredText
                         focus: modalScope.visible
                         onClicked: {
                             if (root.notice.title) bridge.clearNotice()

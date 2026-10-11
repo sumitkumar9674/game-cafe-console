@@ -41,6 +41,24 @@ class AvatarProvider(QQuickImageProvider):
         return image
 
 
+class WallpaperProvider(QQuickImageProvider):
+    """Serve only the validated wallpaper blob managed by the local store."""
+
+    def __init__(self, store: Store):
+        super().__init__(QQuickImageProvider.Image)
+        self.store = store
+
+    def requestImage(self, image_id, size, requested_size):
+        current = self.store.wallpaper_content()
+        image = QImage.fromData(current[1]) if current else QImage()
+        if (not image.isNull() and requested_size.width() > 0
+                and requested_size.height() > 0):
+            image = image.scaled(
+                requested_size, Qt.KeepAspectRatioByExpanding,
+                Qt.SmoothTransformation)
+        return image
+
+
 class QtHost:
     def _load_ui(self):
         branded_icon = QIcon(str(APP_ICON_PATH)) if APP_ICON_PATH.is_file() else QIcon()
@@ -49,6 +67,7 @@ class QtHost:
         QQuickStyle.setStyle("Material")
         self.engine = QQmlApplicationEngine()
         self.engine.addImageProvider("cafe", AvatarProvider(self.store))
+        self.engine.addImageProvider("wallpaper", WallpaperProvider(self.store))
         self.bridge = CafeBridge(self.store, self, self.runtime, self.child)
         self.engine.rootContext().setContextProperty("bridge", self.bridge)
         qml = Path(__file__).resolve().parent / "qml" / "App.qml"

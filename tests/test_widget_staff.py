@@ -58,6 +58,36 @@ class WidgetLifecycleTest(unittest.TestCase):
         self.store_patch.stop()
         self.temp.cleanup()
 
+    def wait_for_idle(self):
+        deadline = time.monotonic() + 5
+        while self.host.bridge.busy and time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(0.01)
+        self.app.processEvents()
+        self.assertFalse(self.host.bridge.busy)
+
+    def show_active_retainer(self, cooldown_minutes=2, known=True):
+        customer = {
+            "customerId": "customer-1", "name": "Sumit",
+            "retainerSessionId": "retainer-1",
+            "retainerCooldownKnown": known,
+            "retainerCooldownMinutes": cooldown_minutes,
+        }
+        self.store.save_local_customer_session({
+            "customer_id": customer["customerId"],
+            "name": customer["name"], "login_id": "login-1",
+            "balance_seconds": 120, "revision": 1,
+            "retainer_session_id": customer["retainerSessionId"],
+            "retainer_active": True, "retainer_state": "active",
+            "displayed_at": time.time(), "last_admin_seen": time.time(),
+            "feedback": "",
+        })
+        self.host.bridge._set_view(
+            retainerActive=True, retainerBalanceText="00:02:00",
+            registeredCustomer=customer)
+        self.app.processEvents()
+        return customer
+
     def test_widget_uses_taskbar_minimize_without_tray_or_session_change(self):
         self.assertEqual(self.host.bridge.mode, "widget")
         self.assertFalse(hasattr(self.host, "tray"))
@@ -89,11 +119,12 @@ class WidgetLifecycleTest(unittest.TestCase):
         self.assertGreaterEqual(self.host.window.minimumHeight(),
                                 min(int(content.property("implicitHeight")),
                                     area.height() - 40))
-        for name in ("widgetPlayerName", "widgetUpdateButton",
-                     "widgetOpenConsoleButton", "widgetFooter"):
+        for name in ("widgetOpenConsoleButton", "widgetFooter"):
             control = self.host.window.findChild(QObject, name)
             self.assertIsNotNone(control)
             self.assertTrue(control.property("visible"))
+        self.assertIsNone(self.host.window.findChild(QObject, "widgetPlayerName"))
+        self.assertIsNone(self.host.window.findChild(QObject, "widgetUpdateButton"))
         maximum = self.host._widget_dimensions(5000, 5000)
         self.assertLessEqual(maximum[0], area.width() - 40)
         self.assertLessEqual(maximum[1], area.height() - 40)
@@ -105,6 +136,156 @@ class WidgetLifecycleTest(unittest.TestCase):
         self.assertNotIn("hideWidget", source)
         self.assertNotIn("Compact", source)
         self.assertFalse(hasattr(self.host.bridge, "hideWidget"))
+
+    def test_active_retainer_offers_stop_without_opening_locked_console(self):
+        stop = self.host.window.findChild(QObject, "widgetStopRetainerButton")
+        open_console = self.host.window.findChild(
+            QObject, "widgetOpenConsoleButton")
+        self.host.bridge._set_view(retainerActive=True)
+        self.app.processEvents()
+        self.assertTrue(stop.property("visible"))
+        self.assertFalse(open_console.property("visible"))
+
+    def test_stop_retainer_confirmation_cancel_keeps_session_and_timer_live(self):
+        self.show_active_retainer(cooldown_minutes=2)
+        stop = self.host.window.findChild(QObject, "widgetStopRetainerButton")
+        stop.clicked.emit()
+        self.app.processEvents()
+        confirmation = self.host.window.property("confirmation")
+        self.assertEqual(confirmation.property("title").toString(),
+                         "End Retainer Session?")
+        message = confirmation.property("message").toString()
+        self.assertIn("Restart Cooldown: 2 minutes", message)
+        self.assertIn("wait 2 minutes", message)
+        self.assertEqual(confirmation.property("cancelLabel").toString(),
+                         "Continue Playing")
+        self.runtime.stop_local_retainer.assert_not_called()
+
+        self.host.bridge._set_view(retainerBalanceText="00:01:59")
+        self.app.processEvents()
+        timer = self.host.window.findChild(QObject, "widgetSessionTimer")
+        self.assertIn("00:01:59", timer.property("text"))
+        self.assertEqual(
+            self.host.window.property("confirmation").property(
+                "title").toString(), "End Retainer Session?")
+
+        QMetaObject.invokeMethod(self.host.window, "cancelConfirmation")
+        self.assertTrue(self.store.local_customer_session()["retainer_active"])
+        self.runtime.stop_local_retainer.assert_not_called()
+
+    def test_confirmed_stop_invokes_existing_operation_once(self):
+        customer = self.show_active_retainer(cooldown_minutes=1)
+        stop = self.host.window.findChild(QObject, "widgetStopRetainerButton")
+        stop.clicked.emit()
+        self.app.processEvents()
+        message = self.host.window.property("confirmation").property(
+            "message").toString()
+        self.assertIn("Restart Cooldown: 1 minute", message)
+        self.assertNotIn("1 minutes", message)
+        QMetaObject.invokeMethod(self.host.window, "acceptConfirmation")
+        QMetaObject.invokeMethod(self.host.window, "acceptConfirmation")
+        self.wait_for_idle()
+        self.runtime.stop_local_retainer.assert_called_once_with()
+
+        # A stale confirmation cannot target a replacement customer/session.
+        self.host.bridge.stopRetainerConfirmed(
+            "different-customer", customer["retainerSessionId"])
+        self.runtime.stop_local_retainer.assert_called_once_with()
+
+    def test_zero_and_unavailable_cooldown_messages_are_not_misleading(self):
+        stop = self.host.window.findChild(QObject, "widgetStopRetainerButton")
+        self.show_active_retainer(cooldown_minutes=0)
+        stop.clicked.emit()
+        self.app.processEvents()
+        message = self.host.window.property("confirmation").property(
+            "message").toString()
+        self.assertIn("No Restart Cooldown", message)
+        self.assertIn("immediately", message)
+        self.assertNotIn("need to wait", message)
+        QMetaObject.invokeMethod(self.host.window, "cancelConfirmation")
+
+        self.show_active_retainer(cooldown_minutes=99, known=False)
+        stop.clicked.emit()
+        self.app.processEvents()
+        message = self.host.window.property("confirmation").property(
+            "message").toString()
+        self.assertIn("Restart Cooldown: Unavailable", message)
+        self.assertNotIn("99", message)
+
+    def test_widget_state_uses_global_cooldown_then_customer_override(self):
+        snapshot, secret = new_pool(
+            "Cafe", self.store.pc_id, "PC-02", "Owner", PASSWORD,
+            self.store.node_public_key())
+        snapshot["settings"]["retainer_restart_cooldown_minutes"] = 7
+        self.store.save_pool(snapshot, secret, join=True)
+        customer = self.store.create_customer(
+            "Sumit", "Owner", "create-widget-customer")
+        self.store.save_local_customer_session({
+            "customer_id": customer["customer_id"], "name": "Sumit",
+            "login_id": "login-1", "balance_seconds": 120,
+            "revision": customer["revision"],
+            "retainer_session_id": "retainer-1", "retainer_active": True,
+            "retainer_state": "active", "displayed_at": time.time(),
+            "last_admin_seen": time.time(), "feedback": "",
+        })
+        self.store.set_local("customer_admin_online", "1")
+        self.runtime.is_admin.return_value = False
+        self.runtime.status.return_value = {"desktop": "Default"}
+        self.runtime.peer_status.return_value = None
+        state = self.host.bridge._collect_state("", True)
+        self.assertTrue(state["registeredCustomer"]["retainerCooldownKnown"])
+        self.assertEqual(
+            state["registeredCustomer"]["retainerCooldownMinutes"], 7)
+
+        self.store.set_customer_cooldown_overrides(
+            customer["customer_id"], 1, None, customer["revision"], "Owner")
+        state = self.host.bridge._collect_state("", True)
+        self.assertEqual(
+            state["registeredCustomer"]["retainerCooldownMinutes"], 1)
+
+    def test_external_end_dismisses_confirmation_without_stop_request(self):
+        self.show_active_retainer()
+        stop = self.host.window.findChild(QObject, "widgetStopRetainerButton")
+        stop.clicked.emit()
+        self.app.processEvents()
+        self.assertEqual(
+            self.host.window.property("confirmation").property(
+                "title").toString(), "End Retainer Session?")
+        self.host.bridge._set_view(retainerActive=False)
+        self.app.processEvents()
+        self.assertTrue(self.host.window.property(
+            "confirmation").property("title").isUndefined())
+        self.runtime.stop_local_retainer.assert_not_called()
+
+    def test_escape_and_close_control_continue_playing(self):
+        self.show_active_retainer()
+        stop = self.host.window.findChild(QObject, "widgetStopRetainerButton")
+        stop.clicked.emit()
+        self.app.processEvents()
+        close = self.host.window.findChild(QObject, "confirmationCloseButton")
+        self.assertTrue(close.property("visible"))
+        close.clicked.emit()
+        self.app.processEvents()
+        self.runtime.stop_local_retainer.assert_not_called()
+        self.assertTrue(self.store.local_customer_session()["retainer_active"])
+
+        stop.clicked.emit()
+        self.app.processEvents()
+        QTest.keyClick(self.host.window, Qt.Key_Escape)
+        self.app.processEvents()
+        self.assertTrue(self.host.window.property(
+            "confirmation").property("title").isUndefined())
+        self.runtime.stop_local_retainer.assert_not_called()
+
+        stop.clicked.emit()
+        self.app.processEvents()
+        self.host.window.close()
+        self.app.processEvents()
+        self.assertTrue(self.host.window.property(
+            "confirmation").property("title").isUndefined())
+        self.assertTrue(self.host.window.isVisible())
+        self.assertFalse(self.host.window.windowState() & Qt.WindowMinimized)
+        self.runtime.stop_local_retainer.assert_not_called()
 
     def test_long_connection_message_wraps_without_horizontal_overflow(self):
         message = "Admin connection unavailable; session tracking continues locally. " * 5

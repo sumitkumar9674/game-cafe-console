@@ -22,7 +22,50 @@ from game_cafe.branding import APP_ICON_PATH, APP_LOGO_PATH, app_logo_source, va
 from game_cafe.qt_bridge import CafeBridge, RecordListModel
 from game_cafe.security import create_local_command_key, seal_local_password
 from game_cafe.qt_app import AvatarProvider
+from game_cafe.presentation import RetainerDisplayClock
 from game_cafe.storage import Store, new_pool
+
+
+class RetainerDisplayClockTest(unittest.TestCase):
+    @staticmethod
+    def state(seconds=100, sample=1000.0, session="session-1",
+              active=True):
+        return {
+            "customer_id": "customer-1", "retainer_session_id": session,
+            "retainer_active": active, "balance_seconds": seconds,
+            "retainer_display_seconds": seconds,
+            "retainer_display_at": sample,
+            "retainer_display_received_monotonic": 10.0,
+        }
+
+    def test_small_updates_keep_monotonic_countdown_and_never_add_time(self):
+        clock = RetainerDisplayClock()
+        self.assertEqual(clock.remaining(
+            self.state(), monotonic_now=10.0), 100)
+        self.assertEqual(clock.remaining(
+            self.state(103, 1001.0), monotonic_now=11.0), 99)
+        self.assertEqual(clock.remaining(
+            self.state(96, 1002.0), monotonic_now=12.0), 98)
+
+    def test_stale_sample_is_ignored_and_large_difference_reconciles(self):
+        clock = RetainerDisplayClock()
+        clock.remaining(self.state(), monotonic_now=10.0)
+        self.assertEqual(clock.remaining(
+            self.state(180, 999.0), monotonic_now=12.0), 98)
+        self.assertEqual(clock.remaining(
+            self.state(60, 1003.0), monotonic_now=13.0), 57)
+
+    def test_message_age_new_session_zero_and_final_value_are_hard_synced(self):
+        clock = RetainerDisplayClock()
+        self.assertEqual(clock.remaining(
+            self.state(100, 995.0), monotonic_now=15.0), 95)
+        self.assertEqual(clock.remaining(
+            self.state(50, 1001.0, "session-2"), monotonic_now=11.0), 49)
+        self.assertEqual(clock.remaining(
+            self.state(0, 1002.0, "session-2"), monotonic_now=12.0), 0)
+        self.assertEqual(clock.remaining(
+            self.state(43, 1003.0, "session-2", active=False),
+            monotonic_now=13.0), 43)
 
 
 class QtPresentationTest(unittest.TestCase):
@@ -66,6 +109,46 @@ class QtPresentationTest(unittest.TestCase):
         changed.assert_called_once()
         reset.assert_not_called()
         self.assertEqual(model.data(model.index(0, 0), model.RowRole)["name"], "New")
+
+    def test_overflow_text_marquee_runs_only_when_needed(self):
+        engine = QQmlApplicationEngine()
+        component = Path(__file__).resolve().parents[1] / "game_cafe" / "qml" / "OverflowText.qml"
+        engine.load(QUrl.fromLocalFile(str(component)))
+        self.assertEqual(len(engine.rootObjects()), 1)
+        item = engine.rootObjects()[0]
+        item.setProperty("width", 220)
+        item.setProperty("text", "Short label")
+        self.app.processEvents()
+        self.assertFalse(item.property("overflowing"))
+        self.assertFalse(item.property("marqueeRunning"))
+        item.setProperty("width", 45)
+        item.setProperty("text", "A deliberately long computer notification label")
+        self.app.processEvents()
+        self.app.processEvents()
+        self.assertTrue(item.property("overflowing"))
+        self.assertTrue(item.property("marqueeRunning"))
+
+    def test_dashboard_sidebar_lists_scroll_independently(self):
+        self.bridge._set_mode("admin")
+        engine = QQmlApplicationEngine()
+        engine.rootContext().setContextProperty("bridge", self.bridge)
+        qml = Path(__file__).resolve().parents[1] / "game_cafe" / "qml" / "App.qml"
+        engine.load(QUrl.fromLocalFile(str(qml)))
+        root = engine.rootObjects()[0]
+        root.setWidth(1366)
+        root.setHeight(768)
+        self.app.processEvents()
+        recent = root.findChild(QObject, "recentSessionsList")
+        notifications = root.findChild(QObject, "notificationList")
+        timestamp_timer = root.findChild(QObject, "notificationTimestampTimer")
+        self.assertIsNotNone(recent)
+        self.assertIsNotNone(notifications)
+        self.assertIsNotNone(timestamp_timer)
+        self.assertEqual(timestamp_timer.property("interval"), 60000)
+        self.assertIsNot(recent, notifications)
+        self.assertTrue(recent.property("clip"))
+        self.assertTrue(notifications.property("clip"))
+        self.assertGreater(recent.height(), notifications.height())
 
     def test_card_selection_and_expansion(self):
         self.bridge.pc_model.update_rows([

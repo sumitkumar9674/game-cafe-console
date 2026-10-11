@@ -16,15 +16,16 @@ from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QFileDialog
 
 from . import desktops, sessions
+from .customers import normalize_customer_name, retainer_text
 from .lifecycle import lifecycle_event
 from .branding import app_logo_source
 from .network import discover
 from .presentation import (add_time_preview, duration, history_rows,
-                           pc_row_data, sort_pc_rows, validate_add,
-                           validate_start)
+                           date_text, pc_row_data, RetainerDisplayClock,
+                           sort_pc_rows, validate_add, validate_start)
 from .runtime import Runtime
 from .security import open_local_password, seal_local_password
-from .storage import Store, new_pool, verify_password
+from .storage import MAX_WALLPAPER_BYTES, Store, new_pool, verify_password
 
 
 DEVELOPER_NAME = "Sumit Kumar"
@@ -100,6 +101,8 @@ class CafeBridge(QObject):
         self._selected_pc = ""
         self._expanded_pc = ""
         self._history_all = True
+        self._selected_customer = ""
+        self._customer_search = ""
         self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="cafe-ui")
         self._jobs: dict[str, Callable] = {}
         self._job_number = 0
@@ -116,12 +119,17 @@ class CafeBridge(QObject):
         self._staff_verifier: dict | None = None
         self._staff_failed_attempts = 0
         self._staff_blocked_until = 0.0
+        self._retainer_stop_pending = False
+        self._retainer_display_clock = RetainerDisplayClock()
         self._runtime_started = False
         self.pc_model = RecordListModel("pcId", self)
         self.history_model = RecordListModel("id", self)
         self.dashboard_history_model = RecordListModel("id", self)
+        self.notification_model = RecordListModel("notificationId", self)
         self.join_model = RecordListModel("requestId", self)
         self.member_model = RecordListModel("pcId", self)
+        self.customer_model = RecordListModel("customerId", self)
+        self.customer_adjustment_model = RecordListModel("adjustmentId", self)
         self.workFinished.connect(self._on_work_finished)
         self.tick_timer = QTimer(self)
         self.tick_timer.timeout.connect(self.tick)
@@ -178,12 +186,28 @@ class CafeBridge(QObject):
         return self.dashboard_history_model
 
     @Property(QObject, constant=True)
+    def notificationModel(self):
+        return self.notification_model
+
+    @Property(QObject, constant=True)
     def joinModel(self):
         return self.join_model
 
     @Property(QObject, constant=True)
     def memberModel(self):
         return self.member_model
+
+    @Property(QObject, constant=True)
+    def customerModel(self):
+        return self.customer_model
+
+    @Property(QObject, constant=True)
+    def customerAdjustmentModel(self):
+        return self.customer_adjustment_model
+
+    @Property(str, notify=selectionChanged)
+    def selectedCustomerId(self):
+        return self._selected_customer
 
     @Property(bool, constant=True)
     def childMode(self):
@@ -567,7 +591,91 @@ class CafeBridge(QObject):
             return state, code, self._branding(self.store.snapshot()) if state == "accepted" else {}
         self._submit("poll_join", work, done)
 
-    def _collect_state(self, selected: str, all_history: bool) -> dict:
+    @staticmethod
+    def _customer_row(account: dict) -> dict:
+        return {
+            "customerId": account["customer_id"], "name": account["name"],
+            "balanceSeconds": account["balance_seconds"],
+            "balanceText": retainer_text(account["balance_seconds"]),
+            "createdText": date_text(account["created_at"]),
+            "modifiedText": date_text(account["modified_at"]),
+            "modifiedBy": account["modified_by"],
+            "revision": account["revision"],
+            "status": account.get("status", "Not logged in"),
+            "loggedInPcId": account.get("loggedInPcId", ""),
+            "syncStatus": account.get("syncStatus", "Pending / Offline"),
+            "syncPeers": account.get("syncPeers", []),
+            "lastRetainerStoppedAt": account.get(
+                "last_retainer_stopped_at", 0) or 0,
+            "lastLoggedOutAt": account.get("last_logged_out_at", 0) or 0,
+            "retainerCooldownOverride": account.get(
+                "retainer_cooldown_minutes"),
+            "loginCooldownOverride": account.get("login_cooldown_minutes"),
+            "retainerCooldownMinutes": account.get(
+                "retainerCooldownMinutes", 0),
+            "retainerCooldownExpiresAt": account.get(
+                "retainerCooldownExpiresAt", 0),
+            "retainerCooldownRemaining": account.get(
+                "retainerCooldownRemaining", 0),
+            "loginCooldownMinutes": account.get("loginCooldownMinutes", 0),
+            "loginCooldownExpiresAt": account.get(
+                "loginCooldownExpiresAt", 0),
+            "loginCooldownRemaining": account.get(
+                "loginCooldownRemaining", 0),
+            "retainerInProgress": bool(account.get("retainerInProgress")),
+            "retainerActive": bool(account.get("retainerActive")),
+        }
+
+    @staticmethod
+    def _customer_adjustment_row(adjustment: dict) -> dict:
+        return {
+            "adjustmentId": adjustment["adjustment_id"],
+            "action": adjustment["action"].title(),
+            "seconds": adjustment["seconds"],
+            "durationText": retainer_text(adjustment["seconds"]),
+            "previousText": retainer_text(adjustment["previous_balance"]),
+            "resultingText": retainer_text(adjustment["resulting_balance"]),
+            "createdText": date_text(adjustment["created_at"]),
+            "adminName": adjustment["admin_name"],
+        }
+
+    @staticmethod
+    def notification_time_text(created_at: int | float,
+                               now: float | None = None) -> str:
+        """Format a compact age and handle future clock values safely."""
+        age = max(0, int((time.time() if now is None else now) - created_at))
+        if age < 60:
+            return "Now"
+        if age < 3600:
+            return f"{age // 60}m"
+        if age < 86400:
+            return f"{age // 3600}h"
+        return f"{age // 86400}d"
+
+    @classmethod
+    def _notification_row(cls, notification: dict,
+                          now: float) -> dict:
+        event_type = notification["event_type"]
+        labels = {"online": "Online", "offline": "Offline",
+                  "closed": "Closed"}
+        details = {"online": "Reconnected", "offline": "Connection lost",
+                   "closed": "Normal shutdown"}
+        return {
+            "notificationId": notification["notification_id"],
+            "pcId": notification["pc_id"],
+            "pcName": notification["pc_name"],
+            "eventType": event_type,
+            "title": f"{notification['pc_name']}  ·  {labels[event_type]}",
+            "detail": details[event_type],
+            "timeText": cls.notification_time_text(
+                notification["created_at"], now),
+            "createdAt": notification["created_at"],
+            "unread": not notification["acknowledged"],
+        }
+
+    def _collect_state(self, selected: str, all_history: bool,
+                       selected_customer: str = "",
+                       customer_search: str = "") -> dict:
         snap = self.store.snapshot()
         if not snap:
             return {}
@@ -579,6 +687,28 @@ class CafeBridge(QObject):
                             self.runtime.peer_status(pc_id) if self.runtime else None,
                             now)
                 for pc_id in snap["members"]] if self.runtime else []
+        if self.runtime and self.runtime.is_admin():
+            customer_pc_states = self.runtime.customer_pc_states()
+            if not isinstance(customer_pc_states, dict):
+                customer_pc_states = {}
+            for row in rows:
+                state = customer_pc_states.get(row["pcId"])
+                if not state:
+                    continue
+                row.update(state)
+                row["registeredCustomerId"] = state["customerId"]
+                row["registeredCustomerName"] = state["customerName"]
+                if state["retainerActive"]:
+                    row.update({
+                        "phase": "RETAINER", "kind": "retainer",
+                        "player": state["customerName"],
+                        "remainingSeconds": state["retainerBalanceSeconds"],
+                        "timeText": duration(state["retainerBalanceSeconds"]),
+                        "detail": "Retainer active · " + duration(
+                            state["retainerBalanceSeconds"]) + " remaining",
+                        "start": False, "add": False, "pause": False,
+                        "resume": False, "lock": False,
+                    })
         computer_sort = snap.get("settings", {}).get("computer_sort", "recent")
         rows = sort_pc_rows(rows, snap, computer_sort)
         session = snap["sessions"].get(own)
@@ -597,10 +727,67 @@ class CafeBridge(QObject):
         admin_online = bool(
             self.runtime and (self.runtime.is_admin() if admin_node
                               else remote_admin_online))
+        customer_state = {"accounts": [], "selected": None,
+                          "adjustments": []}
+        if (self.runtime and self._mode == "admin"
+                and self.runtime.admin_ui_open is True):
+            customer_state = self.runtime.customer_admin_state(
+                customer_search, selected_customer)
+        elif self.child or self._mode == "widget":
+            customer_state["accounts"] = self.store.customer_accounts(
+                customer_search)
+        for account in customer_state["accounts"]:
+            if "retainerCooldownMinutes" not in account:
+                cooldowns = self.store.customer_cooldown_state(account, now)
+                account.update({
+                    "retainerCooldownMinutes": cooldowns["retainer_minutes"],
+                    "retainerCooldownExpiresAt": cooldowns[
+                        "retainer_expires_at"],
+                    "retainerCooldownRemaining": cooldowns[
+                        "retainer_remaining"],
+                    "loginCooldownMinutes": cooldowns["login_minutes"],
+                    "loginCooldownExpiresAt": cooldowns["login_expires_at"],
+                    "loginCooldownRemaining": cooldowns["login_remaining"],
+                })
+        customer_rows = [self._customer_row(item)
+                         for item in customer_state["accounts"]]
+        selected_customer_row = (
+            self._customer_row(customer_state["selected"])
+            if customer_state["selected"] else {}
+        )
+        local_customer = self.store.local_customer_session() or {}
+        local_retainer_remaining = self._retainer_display_clock.remaining(
+            local_customer)
+        if self.runtime and self._mode == "widget":
+            registered_admin_online = bool(
+                self.runtime.is_admin()
+                or self.store.local("customer_admin_online") == "1")
+        elif self.runtime:
+            registered_admin_online = admin_online
+        else:
+            registered_admin_online = (
+                self.store.local("customer_admin_online") == "1")
+        local_customer_account = (
+            self.store.customer_account(local_customer.get("customer_id", ""))
+            if local_customer.get("customer_id") else None)
+        retainer_cooldown_known = bool(
+            registered_admin_online and local_customer_account)
+        effective_retainer_cooldown = (
+            self.store.customer_cooldown_state(
+                local_customer_account, now)["retainer_minutes"]
+            if retainer_cooldown_known else 0)
+        access_allowed = (phase in ("buffer", "timed", "open", "paused")
+                          or bool(local_customer.get("retainer_active")))
+        wallpaper_id = self.store.current_wallpaper_id()
+        notifications = (self.store.notifications()
+                         if self.runtime and self.runtime.is_admin() else [])
+        notification_rows = [self._notification_row(item, now)
+                             for item in notifications]
         return {
             "snapshot": snap, "rows": rows,
             "history": history_rows(snap, None if all_history else selected),
             "dashboardHistory": history_rows(snap, selected) if selected else [],
+            "notifications": notification_rows,
             "joins": [{"requestId": item["request_id"],
                        "pcId": item["pc_id"], "name": item["proposed_name"],
                        "ip": item["ip"], "attempts": item["attempts"]}
@@ -615,18 +802,53 @@ class CafeBridge(QObject):
                                 "online": pc_id == own or
                                 (self.runtime.peer_status(pc_id) is not None if self.runtime else False)}
                                for pc_id, member in snap["members"].items()],
+            "customers": customer_rows,
+            "customerAdjustments": [
+                self._customer_adjustment_row(item)
+                for item in customer_state["adjustments"]
+            ],
+            "selectedCustomer": selected_customer_row,
+            "customerSearch": customer_search,
+            "customerCount": len(customer_rows),
+            "customerAdjustmentCount": len(customer_state["adjustments"]),
             "cafeName": snap["cafe_name"],
             "ownName": snap["members"].get(own, {}).get("name", "PC"),
             "session": session, "phase": phase.upper(),
             "kind": session["kind"] if session else "none",
-            "player": session["player"] if session else "Guest",
+            "player": (local_customer.get("name") or
+                       (session["player"] if session else "Guest")),
             "timeText": duration(remaining),
             "remainingSeconds": remaining,
             "paidMinutes": session["paid_minutes"] if session else 0,
             "bufferMinutes": session["buffer_minutes"] if session else 0,
             "hasSession": bool(session),
-            "accessAllowed": phase in ("buffer", "timed", "open", "paused"),
-            "canSwitchAdmin": session is None,
+            "hasOrdinarySession": bool(session),
+            "accessAllowed": access_allowed,
+            "canSwitchAdmin": session is None and not local_customer,
+            "guestMode": not bool(local_customer),
+            "registeredCustomer": {
+                "customerId": local_customer.get("customer_id", ""),
+                "name": local_customer.get("name", ""),
+                "balanceSeconds": local_retainer_remaining,
+                "balanceText": retainer_text(local_retainer_remaining),
+                "revision": int(local_customer.get("revision", 0)),
+                "retainerSessionId": local_customer.get(
+                    "retainer_session_id", ""),
+                "retainerCooldownKnown": retainer_cooldown_known,
+                "retainerCooldownMinutes": effective_retainer_cooldown,
+                "retainerCooldownExpiresAt": int(local_customer.get(
+                    "retainer_cooldown_expires_at", 0)),
+                "loginCooldownExpiresAt": int(local_customer.get(
+                    "login_cooldown_expires_at", 0)),
+            },
+            "retainerActive": bool(local_customer.get("retainer_active")),
+            "retainerFinalizing": bool(local_customer.get(
+                "retainer_finalizing")),
+            "retainerBalanceSeconds": local_retainer_remaining,
+            "retainerBalanceText": retainer_text(local_retainer_remaining),
+            "registeredLoginAvailable": bool(
+                registered_admin_online and not session and not local_customer),
+            "registeredAdminOnline": registered_admin_online,
             "adminNode": admin_node,
             "adminOnline": admin_online,
             "adminPcName": snap["members"].get(admin_id, {}).get(
@@ -637,10 +859,19 @@ class CafeBridge(QObject):
             "hasAvatar": bool(snap.get("logo")),
             "avatarSource": ("image://cafe/avatar/" + str(hash(snap.get("logo"))))
                             if snap.get("logo") else "",
+            "wallpaperConfigured": bool(snap.get("wallpaper")),
+            "wallpaperId": wallpaper_id,
+            "wallpaperSource": (
+                "image://wallpaper/current/" + wallpaper_id
+                if wallpaper_id else ""),
             "settings": {"cafeName": snap["cafe_name"],
                          "adminName": snap["admin_name"],
                          "graceMinutes": snap["settings"]["grace_minutes"],
-                         "signoutMinutes": snap["settings"]["auto_signout_minutes"]},
+                         "signoutMinutes": snap["settings"]["auto_signout_minutes"],
+                         "retainerCooldownMinutes": snap["settings"].get(
+                             "retainer_restart_cooldown_minutes", 0),
+                         "loginCooldownMinutes": snap["settings"].get(
+                             "customer_login_cooldown_minutes", 0)},
             "computerSort": computer_sort,
             "poolId": snap["pool_id"],
             "unlockRequests": sum(bool(value) for value in snap["unlock_requests"].values()),
@@ -648,6 +879,8 @@ class CafeBridge(QObject):
             "totalCount": len(snap["members"]),
             "recentCount": sum(len(group) for group in snap["history"].values()),
             "pendingCount": len(pending),
+            "notificationUnreadCount": sum(
+                row["unread"] for row in notification_rows),
         }
 
     @Slot()
@@ -659,6 +892,8 @@ class CafeBridge(QObject):
             return
         self._refresh_pending = True
         selected, all_history = self._selected_pc, self._history_all
+        selected_customer = self._selected_customer
+        customer_search = self._customer_search
         def done(result, error):
             self._refresh_pending = False
             again = self._refresh_again
@@ -674,8 +909,12 @@ class CafeBridge(QObject):
             self.history_model.update_rows(result.pop("history"))
             self.dashboard_history_model.update_rows(
                 result.pop("dashboardHistory"))
+            self.notification_model.update_rows(result.pop("notifications"))
             self.join_model.update_rows(result.pop("joins"))
             self.member_model.update_rows(result.pop("members"))
+            self.customer_model.update_rows(result.pop("customers"))
+            self.customer_adjustment_model.update_rows(
+                result.pop("customerAdjustments"))
             snap = result.pop("snapshot")
             if self.child:
                 session_id = result["session"]["id"] if result["session"] else None
@@ -692,7 +931,147 @@ class CafeBridge(QObject):
                 self._set_status(self._candidate_status(result))
             if self._mode == "widget":
                 self.host.update_widget_access(bool(result["accessAllowed"]))
-        self._submit("refresh", lambda: self._collect_state(selected, all_history), done)
+        self._submit(
+            "refresh",
+            lambda: self._collect_state(
+                selected, all_history, selected_customer, customer_search),
+            done,
+        )
+
+    @Slot()
+    def acknowledgeNotifications(self) -> None:
+        """Acknowledge locally without sending a command to any PC."""
+        self.store.acknowledge_notifications()
+        self.notification_model.update_rows([
+            {**row, "unread": False} for row in self.notification_model.rows
+        ])
+        self._set_view(notificationUnreadCount=0)
+
+    @Slot(str)
+    def setCustomerSearch(self, search: str) -> None:
+        search = " ".join(search.split())
+        if search != self._customer_search:
+            self._customer_search = search
+            self.refresh()
+
+    @Slot(str)
+    def selectCustomer(self, customer_id: str) -> None:
+        if customer_id not in {row["customerId"] for row in self.customer_model.rows}:
+            return
+        if customer_id != self._selected_customer:
+            self._selected_customer = customer_id
+            self.selectionChanged.emit()
+            self.refresh()
+
+    @Slot(str, result=str)
+    def normalizeCustomerName(self, name: str) -> str:
+        try:
+            return normalize_customer_name(name)[0]
+        except ValueError:
+            return ""
+
+    @Slot(str)
+    def createCustomer(self, name: str) -> None:
+        def done(result, error):
+            if error:
+                self._show_notice("Could not create customer", str(error), True)
+            else:
+                self._selected_customer = result["customer_id"]
+                self.selectionChanged.emit()
+                self._show_notice("Customer created",
+                                  f"{result['name']} is ready for retainer management.")
+            self.refresh()
+        self._submit(
+            "create_customer",
+            lambda: self.runtime.create_customer(name, uuid.uuid4().hex),
+            done, blocking=True,
+        )
+
+    @Slot(str, str, str, str, result="QVariantMap")
+    def previewCustomerAdjustment(self, customer_id: str, action: str,
+                                  hours: str, minutes: str):
+        try:
+            preview = self.runtime.preview_customer_adjustment(
+                customer_id, action, hours, minutes)
+            return {
+                **preview,
+                "durationText": retainer_text(preview["seconds"]),
+                "previousText": retainer_text(preview["previousBalance"]),
+                "resultingText": retainer_text(preview["resultingBalance"]),
+            }
+        except Exception as error:
+            self._show_notice("Invalid retainer adjustment", str(error), True)
+            return {}
+
+    @Slot("QVariantMap")
+    def commitCustomerAdjustment(self, preview) -> None:
+        data = dict(preview)
+        self._action(
+            "adjust_customer",
+            lambda: self.runtime.adjust_customer(data),
+            "Retainer balance updated.",
+        )
+
+    @Slot(str, str, int)
+    def deleteCustomer(self, customer_id: str, exact_name: str,
+                       expected_revision: int) -> None:
+        def work():
+            return self.runtime.delete_customer(
+                customer_id, exact_name, expected_revision, uuid.uuid4().hex)
+
+        def done(_result, error):
+            if error:
+                self._show_notice("Could not delete customer", str(error), True)
+            else:
+                if self._selected_customer == customer_id:
+                    self._selected_customer = ""
+                    self.selectionChanged.emit()
+                self._show_notice("Customer deleted",
+                                  "The account was permanently deleted.")
+            self.refresh()
+        self._submit("delete_customer", work, done, blocking=True)
+
+    @Slot(str)
+    def releaseCustomerLogin(self, customer_id: str) -> None:
+        self._action(
+            "release_customer_login",
+            lambda: self.runtime.release_customer_ownership(customer_id),
+            "Customer login released. The target PC will return to Guest mode.",
+        )
+
+    @Slot(str, str, str, int)
+    def saveCustomerCooldownOverrides(self, customer_id: str,
+                                      retainer: str, login: str,
+                                      expected_revision: int) -> None:
+        def optional_minutes(value: str) -> int | None:
+            value = value.strip()
+            if not value:
+                return None
+            return int(value)
+
+        try:
+            retainer_minutes = optional_minutes(retainer)
+            login_minutes = optional_minutes(login)
+        except ValueError:
+            self._show_notice(
+                "Invalid cooldown", "Use whole minutes or leave the field blank.",
+                True)
+            return
+        self._action(
+            "customer_cooldown_overrides",
+            lambda: self.runtime.set_customer_cooldown_overrides(
+                customer_id, retainer_minutes, login_minutes,
+                expected_revision),
+            "Customer cooldown overrides saved.",
+        )
+
+    @Slot(str, str)
+    def clearCustomerCooldown(self, customer_id: str, kind: str) -> None:
+        self._action(
+            "clear_customer_cooldown",
+            lambda: self.runtime.clear_customer_cooldown(customer_id, kind),
+            "Active customer cooldown cleared.",
+        )
 
     @Slot(str)
     def selectPc(self, pc_id: str) -> None:
@@ -835,6 +1214,24 @@ class CafeBridge(QObject):
             developer_website=DEVELOPER_WEBSITE,
             developer_contact=DEVELOPER_EMAIL), "Settings saved for the café.")
 
+    @Slot(str, str)
+    def saveCustomerAccessSettings(self, retainer: str, login: str) -> None:
+        try:
+            retainer_minutes = int(retainer)
+            login_minutes = int(login)
+        except ValueError:
+            self._show_notice(
+                "Invalid cooldown", "Enter whole-number minutes.", True)
+            return
+        self._action(
+            "customer_access_settings",
+            lambda: self.runtime.admin_action(
+                "customer_access_settings",
+                retainer_minutes=retainer_minutes,
+                login_minutes=login_minutes),
+            "Customer cooldown settings saved for the cafe.",
+        )
+
     @Slot(str, str, str)
     def changePassword(self, old: str, new: str, confirmation: str) -> None:
         if new != confirmation:
@@ -904,6 +1301,83 @@ class CafeBridge(QObject):
             return ""
         return QUrl.fromLocalFile(str(source)).toString()
 
+    @Slot(result=str)
+    def browseWallpaper(self) -> str:
+        path, _ = QFileDialog.getOpenFileName(
+            None, "Choose locked Console wallpaper", "",
+            "Images (*.png *.jpg *.jpeg)")
+        return path
+
+    @Slot(str, result=str)
+    def wallpaperPreviewSource(self, path: str) -> str:
+        clean = path.strip().strip('"')
+        if clean.startswith("file:"):
+            clean = QUrl(clean).toLocalFile()
+        source = Path(clean) if clean else None
+        if (not source or source.suffix.lower() not in (".png", ".jpg", ".jpeg")
+                or not source.is_file() or source.stat().st_size > 25_000_000
+                or QImage(str(source)).isNull()):
+            return ""
+        return QUrl.fromLocalFile(str(source)).toString()
+
+    @Slot(str)
+    def setWallpaper(self, path: str) -> None:
+        def work():
+            from PySide6.QtCore import QBuffer, QIODevice
+
+            clean = path.strip().strip('"')
+            if clean.startswith("file:"):
+                clean = QUrl(clean).toLocalFile()
+            source = Path(clean)
+            if source.suffix.lower() not in (".png", ".jpg", ".jpeg"):
+                raise ValueError("Choose a PNG or JPG/JPEG file.")
+            if not source.is_file() or source.stat().st_size > 25_000_000:
+                raise ValueError("Choose an existing image smaller than 25 MB.")
+            original = QImage(str(source))
+            if original.isNull():
+                raise ValueError("This image cannot be read.")
+
+            def encode(image: QImage, format_name: str,
+                       quality: int = -1) -> bytes:
+                data = QByteArray()
+                buffer = QBuffer(data)
+                buffer.open(QIODevice.WriteOnly)
+                saved = image.save(buffer, format_name, quality)
+                buffer.close()
+                if not saved:
+                    raise ValueError("The wallpaper could not be encoded.")
+                return bytes(data)
+
+            image = original.scaled(
+                2560, 1440, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            if source.suffix.lower() == ".png":
+                png = encode(image, "PNG")
+                if len(png) <= MAX_WALLPAPER_BYTES:
+                    return self.runtime.set_locked_wallpaper(png, "image/png")
+            for width, height in ((2560, 1440), (1920, 1080),
+                                  (1600, 900), (1280, 720)):
+                candidate = original.scaled(
+                    width, height, Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation).convertToFormat(
+                        QImage.Format_RGB32)
+                for quality in (88, 78, 68, 58):
+                    jpeg = encode(candidate, "JPG", quality)
+                    if len(jpeg) <= MAX_WALLPAPER_BYTES:
+                        return self.runtime.set_locked_wallpaper(
+                            jpeg, "image/jpeg")
+            raise ValueError(
+                "The wallpaper is still larger than 500 KB after optimization.")
+
+        self._action(
+            "locked_wallpaper", work,
+            "Locked Console wallpaper saved and shared.")
+
+    @Slot()
+    def resetWallpaper(self) -> None:
+        self._action(
+            "reset_locked_wallpaper", self.runtime.reset_locked_wallpaper,
+            "Locked Console wallpaper reset to the GameGrid background.")
+
     @Slot(str)
     def searchOtherPools(self, password: str) -> None:
         def work():
@@ -953,18 +1427,90 @@ class CafeBridge(QObject):
         if self.child:
             self._post_child("end")
 
+    @Slot(str, str)
+    def loginCustomer(self, customer_id: str, password: str) -> None:
+        if not self.child or not customer_id or not password:
+            return
+        self._post_child("customer_login", {
+            "customer_id": customer_id, "password": password,
+            "operation_id": uuid.uuid4().hex,
+        })
+
+    @Slot()
+    def logoutCustomer(self) -> None:
+        if self.child:
+            self._post_child("customer_logout")
+
+    @Slot(str, str, str)
+    def changeCustomerPassword(self, current_password: str,
+                               new_password: str, confirmation: str) -> None:
+        if not self.child:
+            return
+        self._post_child("customer_password", {
+            "current_password": current_password,
+            "new_password": new_password, "confirmation": confirmation,
+        })
+
+    @Slot()
+    def startRetainer(self) -> None:
+        if self.child:
+            self._post_child("retainer_start", {
+                "operation_id": uuid.uuid4().hex})
+
+    @Slot()
+    def stopRetainer(self) -> None:
+        if self.child:
+            self._post_child("retainer_stop")
+        elif self.runtime:
+            def done(_result, error):
+                if error:
+                    self._show_notice("Retainer stop failed", str(error), True)
+                self.refresh()
+            self._submit("retainer_stop", self.runtime.stop_local_retainer,
+                         done, blocking=True)
+
+    @Slot(str, str)
+    def stopRetainerConfirmed(self, customer_id: str,
+                              retainer_session_id: str) -> None:
+        """Stop only the active retainer captured by the widget confirmation."""
+        if (self.child or not self.runtime or self._retainer_stop_pending
+                or self._busy):
+            return
+        local = self.store.local_customer_session() or {}
+        if (not local.get("retainer_active")
+                or local.get("customer_id") != customer_id
+                or local.get("retainer_session_id") != retainer_session_id):
+            self.refresh()
+            return
+        self._retainer_stop_pending = True
+
+        def done(_result, error):
+            self._retainer_stop_pending = False
+            if error:
+                self._show_notice("Retainer stop failed", str(error), True)
+            self.refresh()
+
+        self._submit("retainer_stop", self.runtime.stop_local_retainer,
+                     done, blocking=True)
+
     def _post_child(self, action: str, payload: dict | None = None) -> None:
-        if payload and "password" in payload:
+        payload = dict(payload or {})
+        password_fields = [key for key in payload
+                           if key == "password" or key.endswith("_password")
+                           or key == "confirmation"]
+        if password_fields:
             public = self.store.local("controller_command_public")
             if not public:
                 self._show_notice("Staff access unavailable",
                                   "The controller password channel is unavailable.", True)
                 return
-            payload = {"password_sealed": seal_local_password(
-                public, payload["password"])}
+            for field in password_fields:
+                payload[field + "_sealed"] = seal_local_password(
+                    public, str(payload.pop(field)))
         self.store.set_local("customer_feedback", "Saving on this PC…" if action in
                              ("end", "rename", "close_software", "staff_start",
-                              "staff_add") else "Sending request to Admin…")
+                              "staff_add", "retainer_stop", "customer_logout")
+                             else "Sending request to Admin…")
         self.store.post_local_command(action, payload)
         self._set_view(feedback=self.store.local("customer_feedback"))
 
@@ -1145,6 +1691,17 @@ class CafeBridge(QObject):
     def closeAdmin(self) -> None:
         self.closeApplication()
 
+    @Slot(result=str)
+    def adminExitMessage(self) -> str:
+        default = (
+            "Exiting disconnects this Admin PC. Existing sessions on other "
+            "User PCs will continue independently."
+        )
+        if self.runtime and self._mode == "admin":
+            message = self.runtime.active_retainer_shutdown_message()
+            return message if isinstance(message, str) else default
+        return default
+
     @Slot()
     def signOutAdmin(self) -> None:
         if self.child or self._mode != "admin" or self._busy:
@@ -1165,6 +1722,11 @@ class CafeBridge(QObject):
             return
         if self.child:
             active_desktop = desktops.active_desktop_name()
+            if active_desktop == "CafeConsole":
+                notice = self.store.take_locked_notice()
+                if notice:
+                    self._show_notice(str(notice.get("title", "Notice")),
+                                      str(notice.get("message", "")))
             if (self._staff_credential and active_desktop
                     and active_desktop != "CafeConsole"):
                 self._revoke_staff()
@@ -1221,6 +1783,75 @@ class CafeBridge(QObject):
                     self.store.set_local("customer_feedback", f"Request failed: {error}")
                 self.refresh()
             self._submit("customer_command", work, done)
+        elif action == "customer_login":
+            def work():
+                password = open_local_password(
+                    self.host.command_private_key, payload["password_sealed"])
+                return self.runtime.login_customer(
+                    payload["customer_id"], password, payload["operation_id"])
+
+            def done(result, error):
+                self.store.set_local(
+                    "customer_feedback",
+                    f"Login failed: {error}" if error else
+                    f"Logged in as {result['name']}.")
+                self.refresh()
+
+            self._submit("customer_login", work, done, blocking=True)
+        elif action == "customer_password":
+            def work():
+                opened = {
+                    key: open_local_password(
+                        self.host.command_private_key,
+                        payload[key + "_sealed"])
+                    for key in ("current_password", "new_password",
+                                "confirmation")
+                }
+                return self.runtime.change_logged_in_customer_password(
+                    opened["current_password"], opened["new_password"],
+                    opened["confirmation"])
+
+            def done(_result, error):
+                self.store.set_local(
+                    "customer_feedback",
+                    f"Password change failed: {error}" if error else
+                    "Password changed successfully.")
+                self.refresh()
+
+            self._submit("customer_password", work, done, blocking=True)
+        elif action == "customer_logout":
+            def done(_result, error):
+                self.store.set_local(
+                    "customer_feedback",
+                    f"Logout failed: {error}" if error else
+                    "Returned to Guest mode.")
+                self.refresh()
+
+            self._submit("customer_logout", self.runtime.logout_customer,
+                         done, blocking=True)
+        elif action == "retainer_start":
+            def done(_result, error):
+                self.store.set_local(
+                    "customer_feedback",
+                    f"Retainer start failed: {error}" if error else
+                    "Retainer play is active.")
+                self.refresh()
+
+            self._submit(
+                "retainer_start",
+                lambda: self.runtime.start_local_retainer(
+                    payload["operation_id"]),
+                done, blocking=True)
+        elif action == "retainer_stop":
+            def done(_result, error):
+                self.store.set_local(
+                    "customer_feedback",
+                    f"Retainer stop failed: {error}" if error else
+                    "Retainer stopped and remaining time saved.")
+                self.refresh()
+
+            self._submit("retainer_stop", self.runtime.stop_local_retainer,
+                         done, blocking=True)
         elif action == "open_admin":
             def work():
                 password = open_local_password(self.host.command_private_key,

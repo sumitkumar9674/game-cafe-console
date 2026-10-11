@@ -9,6 +9,60 @@ import time
 from . import sessions
 
 
+RETAINER_DISPLAY_TOLERANCE_SECONDS = 30
+
+
+class RetainerDisplayClock:
+    """Smooth a live retainer display without becoming an accounting clock."""
+
+    def __init__(self) -> None:
+        self._key: tuple[str, str] | None = None
+        self._base_seconds = 0
+        self._base_monotonic = 0.0
+        self._last_sample_at = 0.0
+
+    def _predicted(self, now: float) -> int:
+        return max(0, self._base_seconds - int(max(0, now - self._base_monotonic)))
+
+    def remaining(self, customer: dict,
+                  monotonic_now: float | None = None) -> int:
+        """Return display-only time, hard-resetting whenever gameplay is inactive."""
+        monotonic_now = time.monotonic() if monotonic_now is None else monotonic_now
+        authoritative = max(0, int(customer.get(
+            "retainer_display_seconds", customer.get("balance_seconds", 0))))
+        if not customer.get("retainer_active"):
+            self._key = None
+            self._base_seconds = authoritative
+            self._base_monotonic = monotonic_now
+            self._last_sample_at = 0.0
+            return authoritative
+
+        key = (str(customer.get("customer_id", "")),
+               str(customer.get("retainer_session_id", "")))
+        sample_at = float(customer.get("retainer_display_at", 0) or 0)
+        received_at = float(customer.get(
+            "retainer_display_received_monotonic", monotonic_now))
+        message_age = max(0, monotonic_now - received_at)
+        reported_now = max(0, authoritative - int(message_age))
+        if key != self._key:
+            self._key = key
+            self._base_seconds = reported_now
+            self._base_monotonic = monotonic_now
+            self._last_sample_at = sample_at
+            return reported_now
+
+        predicted = self._predicted(monotonic_now)
+        if sample_at <= self._last_sample_at:
+            return predicted
+        self._last_sample_at = sample_at
+        if (reported_now == 0 or
+                abs(reported_now - predicted) >= RETAINER_DISPLAY_TOLERANCE_SECONDS):
+            self._base_seconds = reported_now
+            self._base_monotonic = monotonic_now
+            return reported_now
+        return predicted
+
+
 def natural_name_key(name: str) -> tuple:
     """Case-insensitive key that keeps PC-2 before PC-10."""
     return tuple((1, int(part)) if part.isdigit() else (0, part)
@@ -52,11 +106,16 @@ def pc_row_data(snapshot: dict, pc_id: str, reported: dict | None,
     grace = snapshot["settings"]["grace_minutes"]
     phase = sessions.phase(session, now, grace)
     online = reported is not None
+    report = reported if isinstance(reported, dict) else {}
     admin = pc_id == snapshot["active_admin"].get("pc_id")
-    desktop = reported.get("desktop") if reported else None
+    desktop = report.get("desktop")
     access = ("ADMIN" if admin else "LOCKED" if desktop == "CafeConsole"
               else "UNLOCKED" if desktop == "Default" else "UNKNOWN")
     remaining = sessions.remaining_seconds(session, now, grace)
+    registered_name = report.get("registered_customer_name", "")
+    retainer_active = bool(report.get("retainer_active"))
+    retainer_remaining = max(0, int(
+        report.get("retainer_remaining", 0)))
     if admin:
         detail = "Admin workstation · Customer controls unavailable"
     elif not session:
@@ -76,16 +135,23 @@ def pc_row_data(snapshot: dict, pc_id: str, reported: dict | None,
         detail = f"Paused · {session['paused_phase'].upper()} · {duration(remaining)} frozen"
     else:
         detail = "Grace expired · Awaiting finalization"
-    can_start = not admin and online and session is None
+    if retainer_active:
+        phase = "retainer"
+        detail = f"Retainer active · {duration(retainer_remaining)} remaining"
+        remaining = retainer_remaining
+    can_start = not admin and online and session is None and not retainer_active
     can_add = not admin and online and bool(session and
-              session["kind"] == "timed" and phase in ("buffer", "timed", "grace", "paused"))
+              session["kind"] == "timed" and phase in (
+                  "buffer", "timed", "grace", "paused")) and not retainer_active
     can_end = not admin and online and session is not None
     return {
         "pcId": pc_id, "name": snapshot["members"][pc_id]["name"],
         "role": "ADMIN" if admin else "USER", "online": online,
         "access": access, "phase": phase.upper(),
-        "player": session["player"] if session else "—",
-        "kind": session["kind"] if session else "none",
+        "player": (registered_name if retainer_active else
+                   session["player"] if session else registered_name or "—"),
+        "kind": ("retainer" if retainer_active else
+                 session["kind"] if session else "none"),
         "detail": detail, "timeText": duration(remaining),
         "remainingSeconds": remaining,
         "paidMinutes": session["paid_minutes"] if session else 0,
@@ -93,10 +159,16 @@ def pc_row_data(snapshot: dict, pc_id: str, reported: dict | None,
         "startedText": date_text(session["started_at"]) if session else "",
         "unlockRequested": pc_id in snapshot["unlock_requests"],
         "start": can_start, "add": can_add, "end": can_end,
-        "pause": not admin and online and bool(session) and phase in ("buffer", "timed", "open"),
+        "pause": not admin and online and bool(session) and phase in (
+            "buffer", "timed", "open") and not retainer_active,
         "resume": not admin and online and phase == "paused",
         "exitSoftware": not admin and online,
-        "lock": not admin and online and session is None,
+        "lock": not admin and online and session is None and not retainer_active,
+        "registeredCustomerId": report.get(
+            "registered_customer_id", ""),
+        "registeredCustomerName": registered_name,
+        "retainerActive": retainer_active,
+        "retainerBalanceSeconds": retainer_remaining,
     }
 
 

@@ -115,6 +115,54 @@ class AdminCloseTest(unittest.TestCase):
         self.assertFalse(self.host.shutting_down)
         self.assertFalse(self.host.window.property("confirmation").property("title").isString())
 
+    def test_unpaired_title_bar_close_uses_graceful_shutdown(self):
+        self.host.bridge._set_mode("onboarding")
+        with patch.object(self.host, "stop_console") as stop_console:
+            self.host.window.close()
+            deadline = time.monotonic() + 3
+            while not self.host.shutting_down and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(0.01)
+        self.assertTrue(self.host.shutting_down)
+        stop_console.assert_called_once()
+        self.runtime.stop.assert_called_once()
+
+    def test_pending_pairing_cancellation_failure_does_not_block_exit(self):
+        self.host.bridge._set_mode("joining")
+        self.host.bridge._join = {
+            "pool": {"ip": "192.0.2.1"}, "requestId": "a" * 32,
+            "cancelToken": "b" * 64, "generation": 1,
+        }
+        self.runtime.cancel_join.side_effect = OSError("Admin unreachable")
+        with patch.object(self.host, "stop_console"):
+            self.host.window.close()
+            deadline = time.monotonic() + 3
+            while not self.host.shutting_down and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(0.01)
+        self.assertTrue(self.host.shutting_down)
+        self.runtime.cancel_join.assert_called_once_with(
+            "192.0.2.1", "a" * 32, "b" * 64)
+        self.runtime.stop.assert_called_once()
+
+    def test_expired_or_rejected_pairing_screen_allows_exit(self):
+        self.host.bridge._set_mode("joining")
+        self.host.bridge._set_view(
+            pairingCode="", pairingState="Request expired or rejected")
+        self.host.bridge._join = {
+            "pool": {"ip": "192.0.2.1"}, "requestId": None,
+            "cancelToken": "", "generation": 1,
+        }
+        with patch.object(self.host, "stop_console"):
+            self.host.window.close()
+            deadline = time.monotonic() + 3
+            while not self.host.shutting_down and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(0.01)
+        self.assertTrue(self.host.shutting_down)
+        self.runtime.cancel_join.assert_not_called()
+        self.runtime.stop.assert_called_once()
+
     def test_failed_local_persistence_keeps_application_open(self):
         self.runtime.prepare_local_shutdown.side_effect = OSError("disk full")
         with patch.object(self.host, "stop_console") as stop_console:
@@ -234,6 +282,16 @@ class AdminCloseTest(unittest.TestCase):
 
 
 class RuntimeShutdownTest(unittest.TestCase):
+    def test_unpaired_shutdown_finalization_is_a_safe_noop(self):
+        with TemporaryDirectory() as folder:
+            store = Store(Path(folder) / "unpaired.sqlite3")
+            try:
+                runtime = Runtime(store)
+                self.assertFalse(runtime.prepare_local_shutdown())
+                self.assertFalse(runtime.local_shutdown_pending)
+            finally:
+                store.close()
+
     def test_stop_waits_for_background_worker(self):
         with TemporaryDirectory() as folder:
             store = Store(Path(folder) / "cafe.sqlite3")

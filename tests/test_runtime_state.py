@@ -174,9 +174,10 @@ class RuntimeStateTest(unittest.TestCase):
         self.admin.admin_action("start", pc_id, kind="open",
                                 paid_minutes=0, buffer_minutes=0)
         with patch.object(self.user.network, "call", side_effect=OSError("offline")):
-            self.user.submit_customer_action("rename", name="Rahul")
+            with self.assertRaisesRegex(ValueError, "cannot be edited"):
+                self.user.submit_customer_action("rename", name="Rahul")
             self.user.submit_customer_action("end")
-        self.assertEqual(self.user_store.snapshot()["history"][pc_id][0]["player"], "Rahul")
+        self.assertEqual(self.user_store.snapshot()["history"][pc_id][0]["player"], "Guest")
         self.admin._poll_peer_statuses()
         self.assertEqual(len(self.admin_store.snapshot()["history"][pc_id]), 1)
 
@@ -392,7 +393,6 @@ class RuntimeStateTest(unittest.TestCase):
         owner = self.user_store.pc_id
         self.admin.admin_action("start", owner, kind="timed",
                                 paid_minutes=30, buffer_minutes=5)
-        self.user.submit_customer_action("rename", name="Sahil")
         with patch.object(self.user.network, "call", side_effect=OSError("offline")):
             self.assertTrue(self.user.prepare_local_shutdown())
             self.assertFalse(self.user.prepare_local_shutdown())
@@ -400,7 +400,7 @@ class RuntimeStateTest(unittest.TestCase):
         self.assertNotIn(owner, snap["sessions"])
         self.assertIsNone(self.user_store.checkpoint())
         self.assertEqual(len(snap["history"][owner]), 1)
-        self.assertEqual(snap["history"][owner][0]["player"], "Sahil")
+        self.assertEqual(snap["history"][owner][0]["player"], "Guest")
         self.assertEqual(snap["history"][owner][0]["reason"], "close_software")
         restarted = Runtime(self.user_store)
         with patch.object(restarted, "_reconcile_local_access"):

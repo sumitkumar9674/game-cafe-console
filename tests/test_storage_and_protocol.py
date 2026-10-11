@@ -9,12 +9,14 @@ import sqlite3
 import unittest
 from unittest.mock import patch
 
-from game_cafe.network import (PAIRING_ALPHABET, create_pairing_key,
-                               open_welcome, pairing_code, pairing_secret,
+from game_cafe.network import (create_pairing_key,
+                               open_welcome, pairing_secret,
                                seal_welcome, signed, verify_signed)
 from game_cafe.storage import Store, new_pool, verify_password
 from game_cafe.security import (create_admin_signing_record,
-                                create_node_keypair, sign_admin_proof, sign_node,
+                                create_handoff_keypair, create_node_keypair,
+                                open_admin_handoff, seal_admin_handoff,
+                                sign_admin_proof, sign_node,
                                 unlock_admin_signing_key, verify_admin_proof,
                                 verify_node)
 
@@ -92,7 +94,8 @@ class StorageAndProtocolTest(unittest.TestCase):
                     "PRAGMA table_info(pending_joins)"
                 )}
                 self.assertTrue({"pairing_public", "pairing_secret", "expires_at",
-                                 "attempts"} <= columns)
+                                 "attempts", "verification_digest",
+                                 "cancel_digest"} <= columns)
                 self.assertEqual(store.db.execute(
                     "SELECT proposed_name FROM pending_joins WHERE request_id='old'"
                 ).fetchone()[0], "Old PC")
@@ -155,10 +158,6 @@ class StorageAndProtocolTest(unittest.TestCase):
         shared = pairing_secret(applicant_private, admin_public)
         self.assertEqual(shared, pairing_secret(admin_private, applicant_public))
         request_id = secrets.token_hex(16)
-        code = pairing_code(shared, request_id)
-        self.assertEqual(len(code), 7)
-        self.assertTrue(set(code) <= set(PAIRING_ALPHABET))
-        self.assertFalse(set(code) & set("O0I1"))
         welcome = {"pool_id": "pool-1", "secret": secrets.token_hex(32)}
         sealed = seal_welcome(shared, request_id, welcome)
         self.assertEqual(open_welcome(shared, request_id, sealed), welcome)
@@ -177,6 +176,37 @@ class StorageAndProtocolTest(unittest.TestCase):
         with self.assertRaises(Exception):
             verify_admin_proof(admin_record["public"],
                                {**proof, "term": 4}, signature)
+
+    @unittest.skipUnless(importlib.util.find_spec("cryptography"),
+                         "cryptography is not installed in this environment")
+    def test_privileged_handoff_is_confidential_bound_and_authenticated(self):
+        recipient_private, recipient_public = create_handoff_keypair()
+        wrong_private, _ = create_handoff_keypair()
+        context = {
+            "pool_id": "pool-1", "source_admin": "pc-a",
+            "candidate": "pc-b", "term": 4,
+            "transfer_id": secrets.token_hex(16),
+            "challenge": secrets.token_hex(16),
+        }
+        payload = {"password_verifier": {
+            "salt": "sensitive-salt", "hash": "sensitive-hash",
+            "iterations": 600000}}
+        sealed = seal_admin_handoff(recipient_public, context, payload)
+        self.assertNotIn("sensitive-salt", str(sealed))
+        self.assertNotIn("sensitive-hash", str(sealed))
+        self.assertEqual(open_admin_handoff(
+            recipient_private, context, sealed), payload)
+        with self.assertRaises(Exception):
+            open_admin_handoff(wrong_private, context, sealed)
+        with self.assertRaises(Exception):
+            open_admin_handoff(recipient_private,
+                               {**context, "candidate": "pc-c"}, sealed)
+        changed = dict(sealed)
+        ciphertext = bytearray.fromhex(changed["ciphertext"])
+        ciphertext[-1] ^= 1
+        changed["ciphertext"] = ciphertext.hex()
+        with self.assertRaises(Exception):
+            open_admin_handoff(recipient_private, context, changed)
 
 
 if __name__ == "__main__":

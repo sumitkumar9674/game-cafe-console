@@ -8,6 +8,7 @@ import os
 
 
 KEY_ITERATIONS = 600_000
+HANDOFF_INFO = b"GameCafeConsole privileged Admin handoff v1"
 
 
 def create_admin_signing_record(password: str) -> dict:
@@ -157,3 +158,74 @@ def open_local_password(controller_private, package: dict) -> str:
         ephemeral_public
     )
     return plaintext.decode("utf-8")
+
+
+def create_handoff_keypair():
+    """Create one ephemeral recipient key for a single authorized handoff."""
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+    private = X25519PrivateKey.generate()
+    public = private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    return private, public.hex()
+
+
+def _handoff_key(shared_secret: bytes, context: dict) -> bytes:
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+    associated = json.dumps(
+        context, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return HKDF(
+        algorithm=hashes.SHA256(), length=32,
+        salt=hashlib.sha256(associated).digest(), info=HANDOFF_INFO,
+    ).derive(shared_secret)
+
+
+def seal_admin_handoff(recipient_public_hex: str, context: dict,
+                       payload: dict) -> dict:
+    """Encrypt Admin-only state to one signed candidate using AES-GCM."""
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+    recipient_bytes = bytes.fromhex(recipient_public_hex)
+    if len(recipient_bytes) != 32:
+        raise ValueError("Invalid Admin handoff recipient key.")
+    recipient = X25519PublicKey.from_public_bytes(recipient_bytes)
+    ephemeral = create_handoff_keypair()[0]
+    sender_public = ephemeral.public_key().public_bytes(Encoding.Raw,
+                                                         PublicFormat.Raw)
+    nonce = os.urandom(12)
+    associated = json.dumps(
+        context, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    plaintext = json.dumps(
+        payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ciphertext = AESGCM(_handoff_key(
+        ephemeral.exchange(recipient), context)).encrypt(
+            nonce, plaintext, associated)
+    return {"sender_public": sender_public.hex(), "nonce": nonce.hex(),
+            "ciphertext": ciphertext.hex()}
+
+
+def open_admin_handoff(recipient_private, context: dict,
+                       package: dict) -> dict:
+    """Authenticate and decrypt a privileged handoff for its intended recipient."""
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    sender_bytes = bytes.fromhex(str(package["sender_public"]))
+    nonce = bytes.fromhex(str(package["nonce"]))
+    ciphertext = bytes.fromhex(str(package["ciphertext"]))
+    if len(sender_bytes) != 32 or len(nonce) != 12 or len(ciphertext) < 16:
+        raise ValueError("Invalid encrypted Admin handoff package.")
+    associated = json.dumps(
+        context, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    plaintext = AESGCM(_handoff_key(
+        recipient_private.exchange(
+            X25519PublicKey.from_public_bytes(sender_bytes)), context)).decrypt(
+                nonce, ciphertext, associated)
+    result = json.loads(plaintext)
+    if not isinstance(result, dict):
+        raise ValueError("Invalid Admin handoff payload.")
+    return result

@@ -58,6 +58,36 @@ class WidgetLifecycleTest(unittest.TestCase):
         self.store_patch.stop()
         self.temp.cleanup()
 
+    def wait_for_idle(self):
+        deadline = time.monotonic() + 5
+        while self.host.bridge.busy and time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(0.01)
+        self.app.processEvents()
+        self.assertFalse(self.host.bridge.busy)
+
+    def show_active_retainer(self, cooldown_minutes=2, known=True):
+        customer = {
+            "customerId": "customer-1", "name": "Sumit",
+            "retainerSessionId": "retainer-1",
+            "retainerCooldownKnown": known,
+            "retainerCooldownMinutes": cooldown_minutes,
+        }
+        self.store.save_local_customer_session({
+            "customer_id": customer["customerId"],
+            "name": customer["name"], "login_id": "login-1",
+            "balance_seconds": 120, "revision": 1,
+            "retainer_session_id": customer["retainerSessionId"],
+            "retainer_active": True, "retainer_state": "active",
+            "displayed_at": time.time(), "last_admin_seen": time.time(),
+            "feedback": "",
+        })
+        self.host.bridge._set_view(
+            retainerActive=True, retainerBalanceText="00:02:00",
+            registeredCustomer=customer)
+        self.app.processEvents()
+        return customer
+
     def test_widget_uses_taskbar_minimize_without_tray_or_session_change(self):
         self.assertEqual(self.host.bridge.mode, "widget")
         self.assertFalse(hasattr(self.host, "tray"))
@@ -89,11 +119,12 @@ class WidgetLifecycleTest(unittest.TestCase):
         self.assertGreaterEqual(self.host.window.minimumHeight(),
                                 min(int(content.property("implicitHeight")),
                                     area.height() - 40))
-        for name in ("widgetPlayerName", "widgetUpdateButton",
-                     "widgetOpenConsoleButton", "widgetFooter"):
+        for name in ("widgetOpenConsoleButton", "widgetFooter"):
             control = self.host.window.findChild(QObject, name)
             self.assertIsNotNone(control)
             self.assertTrue(control.property("visible"))
+        self.assertIsNone(self.host.window.findChild(QObject, "widgetPlayerName"))
+        self.assertIsNone(self.host.window.findChild(QObject, "widgetUpdateButton"))
         maximum = self.host._widget_dimensions(5000, 5000)
         self.assertLessEqual(maximum[0], area.width() - 40)
         self.assertLessEqual(maximum[1], area.height() - 40)
@@ -105,6 +136,156 @@ class WidgetLifecycleTest(unittest.TestCase):
         self.assertNotIn("hideWidget", source)
         self.assertNotIn("Compact", source)
         self.assertFalse(hasattr(self.host.bridge, "hideWidget"))
+
+    def test_active_retainer_offers_stop_without_opening_locked_console(self):
+        stop = self.host.window.findChild(QObject, "widgetStopRetainerButton")
+        open_console = self.host.window.findChild(
+            QObject, "widgetOpenConsoleButton")
+        self.host.bridge._set_view(retainerActive=True)
+        self.app.processEvents()
+        self.assertTrue(stop.property("visible"))
+        self.assertFalse(open_console.property("visible"))
+
+    def test_stop_retainer_confirmation_cancel_keeps_session_and_timer_live(self):
+        self.show_active_retainer(cooldown_minutes=2)
+        stop = self.host.window.findChild(QObject, "widgetStopRetainerButton")
+        stop.clicked.emit()
+        self.app.processEvents()
+        confirmation = self.host.window.property("confirmation")
+        self.assertEqual(confirmation.property("title").toString(),
+                         "End Retainer Session?")
+        message = confirmation.property("message").toString()
+        self.assertIn("Restart Cooldown: 2 minutes", message)
+        self.assertIn("wait 2 minutes", message)
+        self.assertEqual(confirmation.property("cancelLabel").toString(),
+                         "Continue Playing")
+        self.runtime.stop_local_retainer.assert_not_called()
+
+        self.host.bridge._set_view(retainerBalanceText="00:01:59")
+        self.app.processEvents()
+        timer = self.host.window.findChild(QObject, "widgetSessionTimer")
+        self.assertIn("00:01:59", timer.property("text"))
+        self.assertEqual(
+            self.host.window.property("confirmation").property(
+                "title").toString(), "End Retainer Session?")
+
+        QMetaObject.invokeMethod(self.host.window, "cancelConfirmation")
+        self.assertTrue(self.store.local_customer_session()["retainer_active"])
+        self.runtime.stop_local_retainer.assert_not_called()
+
+    def test_confirmed_stop_invokes_existing_operation_once(self):
+        customer = self.show_active_retainer(cooldown_minutes=1)
+        stop = self.host.window.findChild(QObject, "widgetStopRetainerButton")
+        stop.clicked.emit()
+        self.app.processEvents()
+        message = self.host.window.property("confirmation").property(
+            "message").toString()
+        self.assertIn("Restart Cooldown: 1 minute", message)
+        self.assertNotIn("1 minutes", message)
+        QMetaObject.invokeMethod(self.host.window, "acceptConfirmation")
+        QMetaObject.invokeMethod(self.host.window, "acceptConfirmation")
+        self.wait_for_idle()
+        self.runtime.stop_local_retainer.assert_called_once_with()
+
+        # A stale confirmation cannot target a replacement customer/session.
+        self.host.bridge.stopRetainerConfirmed(
+            "different-customer", customer["retainerSessionId"])
+        self.runtime.stop_local_retainer.assert_called_once_with()
+
+    def test_zero_and_unavailable_cooldown_messages_are_not_misleading(self):
+        stop = self.host.window.findChild(QObject, "widgetStopRetainerButton")
+        self.show_active_retainer(cooldown_minutes=0)
+        stop.clicked.emit()
+        self.app.processEvents()
+        message = self.host.window.property("confirmation").property(
+            "message").toString()
+        self.assertIn("No Restart Cooldown", message)
+        self.assertIn("immediately", message)
+        self.assertNotIn("need to wait", message)
+        QMetaObject.invokeMethod(self.host.window, "cancelConfirmation")
+
+        self.show_active_retainer(cooldown_minutes=99, known=False)
+        stop.clicked.emit()
+        self.app.processEvents()
+        message = self.host.window.property("confirmation").property(
+            "message").toString()
+        self.assertIn("Restart Cooldown: Unavailable", message)
+        self.assertNotIn("99", message)
+
+    def test_widget_state_uses_global_cooldown_then_customer_override(self):
+        snapshot, secret = new_pool(
+            "Cafe", self.store.pc_id, "PC-02", "Owner", PASSWORD,
+            self.store.node_public_key())
+        snapshot["settings"]["retainer_restart_cooldown_minutes"] = 7
+        self.store.save_pool(snapshot, secret, join=True)
+        customer = self.store.create_customer(
+            "Sumit", "Owner", "create-widget-customer")
+        self.store.save_local_customer_session({
+            "customer_id": customer["customer_id"], "name": "Sumit",
+            "login_id": "login-1", "balance_seconds": 120,
+            "revision": customer["revision"],
+            "retainer_session_id": "retainer-1", "retainer_active": True,
+            "retainer_state": "active", "displayed_at": time.time(),
+            "last_admin_seen": time.time(), "feedback": "",
+        })
+        self.store.set_local("customer_admin_online", "1")
+        self.runtime.is_admin.return_value = False
+        self.runtime.status.return_value = {"desktop": "Default"}
+        self.runtime.peer_status.return_value = None
+        state = self.host.bridge._collect_state("", True)
+        self.assertTrue(state["registeredCustomer"]["retainerCooldownKnown"])
+        self.assertEqual(
+            state["registeredCustomer"]["retainerCooldownMinutes"], 7)
+
+        self.store.set_customer_cooldown_overrides(
+            customer["customer_id"], 1, None, customer["revision"], "Owner")
+        state = self.host.bridge._collect_state("", True)
+        self.assertEqual(
+            state["registeredCustomer"]["retainerCooldownMinutes"], 1)
+
+    def test_external_end_dismisses_confirmation_without_stop_request(self):
+        self.show_active_retainer()
+        stop = self.host.window.findChild(QObject, "widgetStopRetainerButton")
+        stop.clicked.emit()
+        self.app.processEvents()
+        self.assertEqual(
+            self.host.window.property("confirmation").property(
+                "title").toString(), "End Retainer Session?")
+        self.host.bridge._set_view(retainerActive=False)
+        self.app.processEvents()
+        self.assertTrue(self.host.window.property(
+            "confirmation").property("title").isUndefined())
+        self.runtime.stop_local_retainer.assert_not_called()
+
+    def test_escape_and_close_control_continue_playing(self):
+        self.show_active_retainer()
+        stop = self.host.window.findChild(QObject, "widgetStopRetainerButton")
+        stop.clicked.emit()
+        self.app.processEvents()
+        close = self.host.window.findChild(QObject, "confirmationCloseButton")
+        self.assertTrue(close.property("visible"))
+        close.clicked.emit()
+        self.app.processEvents()
+        self.runtime.stop_local_retainer.assert_not_called()
+        self.assertTrue(self.store.local_customer_session()["retainer_active"])
+
+        stop.clicked.emit()
+        self.app.processEvents()
+        QTest.keyClick(self.host.window, Qt.Key_Escape)
+        self.app.processEvents()
+        self.assertTrue(self.host.window.property(
+            "confirmation").property("title").isUndefined())
+        self.runtime.stop_local_retainer.assert_not_called()
+
+        stop.clicked.emit()
+        self.app.processEvents()
+        self.host.window.close()
+        self.app.processEvents()
+        self.assertTrue(self.host.window.property(
+            "confirmation").property("title").isUndefined())
+        self.assertTrue(self.host.window.isVisible())
+        self.assertFalse(self.host.window.windowState() & Qt.WindowMinimized)
+        self.runtime.stop_local_retainer.assert_not_called()
 
     def test_long_connection_message_wraps_without_horizontal_overflow(self):
         message = "Admin connection unavailable; session tracking continues locally. " * 5
@@ -178,6 +359,16 @@ class StaffAccessTest(unittest.TestCase):
         self.assertEqual(self.bridge.notice["title"],
                          "Staff authentication failed")
 
+    def test_designated_admin_node_staff_access_returns_to_login(self):
+        self.store.update(lambda state: state["active_admin"].update(
+            pc_id=self.store.pc_id))
+        self.authorize()
+        self.bridge.switchAdmin()
+        commands = self.store.take_local_commands()
+        self.assertEqual([action for action, _ in commands], ["return_to_login"])
+        self.assertNotIn(PASSWORD, str(commands))
+        self.assertFalse(self.bridge.staffAuthorized)
+
     def test_repeated_failures_temporarily_block_staff_login(self):
         self.bridge._staff_failed_attempts = 4
         self.bridge.authenticateStaff("incorrect password")
@@ -248,6 +439,145 @@ class StaffAccessTest(unittest.TestCase):
             self.assertTrue(popup.property("visible"))
             self.assertEqual(popup_list.property("count"), count)
             QMetaObject.invokeMethod(popup, "close")
+
+    def test_staff_access_fits_1366_by_768_and_uses_role_specific_action(self):
+        engine = QQmlApplicationEngine()
+        engine.rootContext().setContextProperty("bridge", self.bridge)
+        qml = Path(__file__).resolve().parents[1] / "game_cafe" / "qml" / "App.qml"
+        engine.load(QUrl.fromLocalFile(str(qml)))
+        root = engine.rootObjects()[0]
+        root.setWidth(1366)
+        root.setHeight(768)
+        console = root.findChild(QObject, "mainLoader").property("item")
+        console.setProperty("staffPanel", "staff")
+        self.app.processEvents()
+
+        panel = root.findChild(QObject, "staffAccessPanel")
+        scroll = root.findChild(QObject, "staffAccessScroll")
+        content = root.findChild(QObject, "staffAccessContent")
+        password = root.findChild(QObject, "staffPasswordField")
+        authenticate = root.findChild(QObject, "staffAuthenticateButton")
+        self.assertGreaterEqual(content.width(), scroll.width() - 2)
+        self.assertGreaterEqual(password.width(), content.width() - 2)
+        self.assertGreaterEqual(authenticate.width(), content.width() - 2)
+
+        self.authorize()
+        self.bridge._set_view(adminNode=False, canSwitchAdmin=True,
+                              hasSession=False)
+        self.app.processEvents()
+
+        setup_row = root.findChild(QObject, "staffSessionSetupRow")
+        start_action = root.findChild(QObject, "staffStartButton")
+        action_row = root.findChild(QObject, "staffActionRow")
+        role_action = root.findChild(QObject, "staffRoleAction")
+        close_action = root.findChild(QObject, "staffCloseSoftware")
+        lock_action = root.findChild(QObject, "lockStaffControls")
+        self.assertIsNotNone(scroll)
+        self.assertLessEqual(panel.height(), console.height() * 0.34 + 1)
+        self.assertLessEqual(panel.y() + panel.height(), console.height())
+        self.assertTrue(scroll.property("visible"))
+        self.assertGreaterEqual(setup_row.width(), content.width() - 2)
+        self.assertGreaterEqual(start_action.width(), content.width() - 2)
+        self.assertGreaterEqual(action_row.width(), content.width() - 2)
+        self.assertGreater(role_action.width(), action_row.width() * 0.25)
+        self.assertGreater(close_action.width(), action_row.width() * 0.25)
+        self.assertGreater(lock_action.width(), action_row.width() * 0.25)
+        self.assertEqual(role_action.property("text"), "Switch to Admin")
+        self.assertTrue(close_action.property("visible"))
+        self.assertTrue(lock_action.property("visible"))
+
+        self.bridge._set_view(adminNode=True)
+        self.app.processEvents()
+        self.assertEqual(role_action.property("text"), "Sign Out")
+
+        root.setHeight(600)
+        self.app.processEvents()
+        self.assertGreater(scroll.property("contentHeight"), scroll.height())
+
+    def test_admin_node_user_console_signout_requires_two_confirmations(self):
+        self.store.update(lambda state: state["active_admin"].update(
+            pc_id=self.store.pc_id))
+        engine = QQmlApplicationEngine()
+        engine.rootContext().setContextProperty("bridge", self.bridge)
+        qml = Path(__file__).resolve().parents[1] / "game_cafe" / "qml" / "App.qml"
+        engine.load(QUrl.fromLocalFile(str(qml)))
+        root = engine.rootObjects()[0]
+        root.findChild(QObject, "mainLoader").property("item").setProperty(
+            "staffPanel", "staff")
+        self.authorize()
+        self.bridge._set_view(adminNode=True, canSwitchAdmin=True,
+                              hasSession=False)
+        self.app.processEvents()
+        sign_out = root.findChild(QObject, "staffRoleAction")
+        self.assertEqual(sign_out.property("text"), "Sign Out")
+
+        sign_out.clicked.emit()
+        sign_out.clicked.emit()
+        self.app.processEvents()
+        confirmation = root.property("confirmation")
+        self.assertEqual(confirmation.property("title").toString(),
+                         "Sign out of User Console?")
+        self.assertEqual(confirmation.property("label").toString(), "Continue")
+        self.assertFalse(self.store.take_local_commands())
+
+        QMetaObject.invokeMethod(root, "cancelConfirmation")
+        self.assertFalse(self.store.take_local_commands())
+        self.assertTrue(self.bridge.staffAuthorized)
+
+        sign_out.clicked.emit()
+        QMetaObject.invokeMethod(root, "acceptConfirmation")
+        self.app.processEvents()
+        confirmation = root.property("confirmation")
+        self.assertEqual(confirmation.property("title").toString(),
+                         "Confirm Sign Out")
+        self.assertEqual(confirmation.property("label").toString(),
+                         "Confirm Sign Out")
+        self.assertEqual(confirmation.property("cancelLabel").toString(),
+                         "Go Back")
+        self.assertFalse(self.store.take_local_commands())
+
+        QMetaObject.invokeMethod(root, "cancelConfirmation")
+        self.app.processEvents()
+        self.assertEqual(root.property("confirmation").property("title").toString(),
+                         "Sign out of User Console?")
+        self.assertFalse(self.store.take_local_commands())
+
+        QMetaObject.invokeMethod(root, "acceptConfirmation")
+        QMetaObject.invokeMethod(root, "acceptConfirmation")
+        QMetaObject.invokeMethod(root, "acceptConfirmation")
+        commands = self.store.take_local_commands()
+        self.assertEqual([action for action, _payload in commands],
+                         ["return_to_login"])
+        self.assertFalse(self.bridge.staffAuthorized)
+        self.assertEqual(self.store.snapshot()["active_admin"]["pc_id"],
+                         self.store.pc_id)
+
+    def test_user_pc_switch_to_admin_keeps_existing_direct_workflow(self):
+        engine = QQmlApplicationEngine()
+        engine.rootContext().setContextProperty("bridge", self.bridge)
+        qml = Path(__file__).resolve().parents[1] / "game_cafe" / "qml" / "App.qml"
+        engine.load(QUrl.fromLocalFile(str(qml)))
+        root = engine.rootObjects()[0]
+        root.findChild(QObject, "mainLoader").property("item").setProperty(
+            "staffPanel", "staff")
+        self.authorize()
+        self.bridge._set_view(adminNode=False, canSwitchAdmin=True,
+                              hasSession=False)
+        self.app.processEvents()
+        switch = root.findChild(QObject, "staffRoleAction")
+        self.assertEqual(switch.property("text"), "Switch to Admin")
+        switch.clicked.emit()
+        self.assertTrue(root.property("confirmation").property("title").isUndefined())
+        self.assertEqual(self.store.take_local_commands()[0][0], "open_admin")
+
+    def test_staff_actions_keep_distinct_start_add_and_close_treatments(self):
+        source = (Path(__file__).resolve().parents[1] / "game_cafe" / "qml" /
+                  "Console.qml").read_text(encoding="utf-8")
+        self.assertIn('objectName: "staffStartButton"', source)
+        self.assertIn('objectName: "staffAddButton"', source)
+        self.assertIn("customColor: theme.active", source)
+        self.assertIn('objectName: "staffCloseSoftware"', source)
+        self.assertIn("danger: true", source)
 
     def test_password_change_invalidates_authorization(self):
         self.authorize()

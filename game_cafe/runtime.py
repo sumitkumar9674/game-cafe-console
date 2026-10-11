@@ -3,28 +3,43 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import base64
+import hashlib
+import hmac
 import json
 import queue
+import re
+import secrets
 import threading
 import time
 import uuid
 
+from cryptography.exceptions import InvalidSignature
+
 from . import sessions
+from .customers import retainer_seconds, validate_cooldown_minutes
 from .desktops import active_desktop_name, switch
 from .lifecycle import lifecycle_event
 from .network import (NodeNetwork, authenticated_call, create_pairing_key,
-                      discover, open_welcome, pairing_code, pairing_secret,
+                      discover, open_welcome, pairing_secret,
                       plain_call, seal_welcome)
 from .presentation import validate_add, validate_start
 from .security import (create_admin_signing_record, sign_admin_proof,
-                       sign_node, unlock_admin_signing_key, verify_admin_proof,
-                       verify_node)
+                       create_handoff_keypair, open_admin_handoff,
+                       seal_admin_handoff, sign_node, unlock_admin_signing_key,
+                       verify_admin_proof, verify_node)
 from .storage import Store, hash_password, verify_password
 
 
 LEASE_SECONDS = 15
 PEER_ONLINE_SECONDS = 9
 SYNC_INTERVAL_SECONDS = 3
+RETAINER_CHECKPOINT_SECONDS = 10
+CUSTOMER_AUTH_ATTEMPTS = 5
+CUSTOMER_AUTH_BLOCK_SECONDS = 30
+HANDOFF_EXPIRY_SECONDS = 60
+HANDOFF_CHUNK_HEX_LENGTH = 300_000
+MAX_HANDOFF_PLAINTEXT = 8_000_000
 
 
 def customer_controls(snapshot: dict, pc_id: str) -> dict[str, bool]:
@@ -61,12 +76,17 @@ class Runtime:
         self.lock = threading.RLock()
         self.peer_statuses: dict[str, tuple[float, dict]] = {}
         self.connection_states: dict[str, bool] = {}
+        self.graceful_disconnects: set[str] = set()
         self.admin_signing_key = None
         self.lease_challenges: dict[tuple[str, str], float] = {}
+        self.handoff_transfer: dict | None = None
         self.handoff_until = 0.0
         self.run_id = uuid.uuid4().hex
         self.last_checkpoint = 0.0
         self.local_shutdown_pending = False
+        self.retainer_clocks: dict[str, tuple[float, float]] = {}
+        self.customer_auth_failures: dict[tuple[str, str], tuple[int, float]] = {}
+        self.retainer_unlock_pending = False
 
     def start(self) -> None:
         self.network.start()
@@ -74,6 +94,11 @@ class Runtime:
             # The bound LAN port excludes a second parent process on this PC.
             if self.store.current_pool_id:
                 self.store.set_local(self._lease_key("until"), "0")
+                self._resume_designated_admin()
+                # A process restart always requires a fresh customer login.
+                self.store.clear_local_customer_session()
+                if self.is_admin():
+                    self.store.recover_interrupted_retainers()
             self.recover_interrupted_session()
             self._migrate_legacy_owner_session()
         except Exception:
@@ -190,15 +215,76 @@ class Runtime:
     def prepare_local_shutdown(self) -> bool:
         """Durably finalize only this PC before any desktop or process teardown."""
         with self.lock:
+            if not self.store.current_pool_id:
+                return False
             if self.local_shutdown_pending:
                 return False
+            had_session = False
+            if self.is_admin():
+                self.prepare_admin_shutdown()
+            local_customer = self.store.local_customer_session()
+            if local_customer:
+                if local_customer.get("retainer_active"):
+                    try:
+                        self.stop_local_retainer()
+                    except Exception:
+                        pass
+                if self.snapshot()["sessions"].get(self.store.pc_id):
+                    had_session = self.finish_local_session(
+                        "close_software", reconcile_access=False)
+                try:
+                    self.logout_customer()
+                except Exception:
+                    self.store.clear_local_customer_session()
             self.local_shutdown_pending = True
             try:
-                return self.finish_local_session("close_software",
-                                                 reconcile_access=False)
+                had_session = (self.finish_local_session(
+                    "close_software", reconcile_access=False) or had_session)
+                self._announce_graceful_shutdown()
+                return had_session
             except Exception:
                 self.local_shutdown_pending = False
                 raise
+
+    def _announce_graceful_shutdown(self) -> None:
+        """Best-effort authenticated notice; shutdown must still work offline."""
+        if self.is_admin():
+            return
+        ip = self.active_admin_ip()
+        if not ip:
+            return
+        try:
+            self.network.call(ip, "graceful_shutdown", {})
+        except Exception:
+            pass
+
+    def prepare_admin_shutdown(self) -> None:
+        """Checkpoint retainers, then tell registered PCs to lock and log out."""
+        if not self.is_admin():
+            return
+        self._checkpoint_active_retainers(force=True)
+        for ownership in list(self.store.customer_ownerships()):
+            retainer = self.store.retainer_for_login(
+                ownership["customer_id"], ownership["pc_id"],
+                ownership["login_id"])
+            if retainer and retainer["state"] == "active":
+                try:
+                    self._stop_authoritative_retainer(
+                        retainer["session_id"], ownership["customer_id"],
+                        ownership["pc_id"], ownership["login_id"],
+                        "admin_shutdown")
+                except Exception:
+                    pass
+                retainer = self.store.retainer_for_login(
+                    ownership["customer_id"], ownership["pc_id"],
+                    ownership["login_id"])
+            account = self.store.customer_account(ownership["customer_id"])
+            self._force_retainer_target(retainer or {
+                **ownership,
+                "balance_seconds": account["balance_seconds"] if account else 0,
+            }, logout=True, reason="admin_shutdown")
+            self.store.force_release_customer(
+                ownership["customer_id"], "admin_shutdown")
 
     def flush_owner_record(self) -> None:
         own_record = next((item for item in self.store.owner_records()
@@ -227,6 +313,39 @@ class Runtime:
 
     def _lease_key(self, field: str) -> str:
         return f"lease_{field}:{self.store.current_pool_id}"
+
+    def _resume_designated_admin(self) -> None:
+        """Restore only this PC's signed designation, never elect a new owner."""
+        with self.lock:
+            snap = self.snapshot()
+            if not snap or snap["active_admin"].get("pc_id") != self.store.pc_id:
+                return
+            claim = snap["active_admin"]
+            term = int(claim.get("term", 0))
+            if int(self.store.local(self._lease_key("handed_off")) or 0) >= term:
+                return
+            proof = {"pool_id": snap["pool_id"], "candidate": self.store.pc_id,
+                     "term": term}
+            signature = claim.get("proof") or ""
+            trusted_keys = {snap["admin_signing"]["public"],
+                            *snap.get("admin_signing_keys", [])}
+            for public_key in trusted_keys:
+                try:
+                    verify_admin_proof(public_key, proof, signature)
+                    break
+                except (ValueError, InvalidSignature):
+                    continue
+            else:
+                return  # An unsigned or invalid claim needs a password-backed login.
+            self._hold_local_claim(term)
+
+            def extend(state):
+                active = state["active_admin"]
+                if active.get("pc_id") != self.store.pc_id or active.get("term") != term:
+                    raise RuntimeError("Admin designation changed during startup.")
+                active["expires_at"] = time.time() + LEASE_SECONDS
+
+            self.store.update(extend)
 
     def is_admin(self) -> bool:
         snap = self.snapshot()
@@ -261,6 +380,7 @@ class Runtime:
         own = self.store.pc_id
         session = snap["sessions"].get(own)
         grace = snap["settings"]["grace_minutes"]
+        customer = self.store.local_customer_session()
         return {
             "registered": True, "pc_id": own,
             "pc_name": snap["members"].get(own, {}).get("name", "PC"),
@@ -272,7 +392,21 @@ class Runtime:
             "access_ready": self._local_access_ready(),
             "admin": self.is_admin(),
             "admin_term": int(snap["active_admin"].get("term", 0)),
+            "registered_customer_id": (customer or {}).get("customer_id", ""),
+            "registered_customer_name": (customer or {}).get("name", ""),
+            "retainer_active": bool((customer or {}).get("retainer_active")),
+            "retainer_remaining": self._local_retainer_remaining(customer),
         }
+
+    @staticmethod
+    def _local_retainer_remaining(customer: dict | None) -> int:
+        if not customer:
+            return 0
+        balance = max(0, int(customer.get("balance_seconds", 0)))
+        if not customer.get("retainer_active"):
+            return balance
+        displayed_at = float(customer.get("displayed_at", time.time()))
+        return max(0, balance - int(max(0, time.time() - displayed_at)))
 
     def peer_status(self, pc_id: str) -> dict | None:
         with self.lock:
@@ -363,9 +497,590 @@ class Runtime:
         if self.store.local("admin_connection_note") != note:
             self.store.set_local("admin_connection_note", note)
 
-    def _require_admin(self) -> None:
+    def _require_admin(self, allow_handoff: bool = False) -> None:
         if not self.is_admin():
             raise PermissionError("An active Admin lease is required.")
+        transfer = self.handoff_transfer
+        if transfer and transfer.get("expires_at", 0) <= time.time():
+            self.handoff_transfer = None
+            transfer = None
+        if transfer and not allow_handoff:
+            raise RuntimeError(
+                "Admin transfer is in progress; authoritative changes are paused.")
+
+    def _require_customer_admin(self) -> None:
+        """Account management additionally requires an authenticated Admin UI."""
+        self._require_admin()
+        if not self.admin_ui_open or self.admin_signing_key is None:
+            raise PermissionError("Authenticated Admin staff access is required.")
+
+    def customer_admin_state(self, search: str = "",
+                             selected_id: str = "") -> dict:
+        self._require_customer_admin()
+        snap = self.snapshot()
+        accounts = self.store.customer_accounts()
+        members = snap["members"]
+        ownerships = {item["customer_id"]: item
+                      for item in self.store.customer_ownerships()}
+        for account in accounts:
+            cooldowns = self.store.customer_cooldown_state(account)
+            account.update({
+                "retainerCooldownMinutes": cooldowns["retainer_minutes"],
+                "retainerCooldownExpiresAt": cooldowns[
+                    "retainer_expires_at"],
+                "retainerCooldownRemaining": cooldowns[
+                    "retainer_remaining"],
+                "loginCooldownMinutes": cooldowns["login_minutes"],
+                "loginCooldownExpiresAt": cooldowns["login_expires_at"],
+                "loginCooldownRemaining": cooldowns["login_remaining"],
+            })
+            records = self.store.customer_sync_records(account["customer_id"])
+            sync_peers = []
+            for pc_id, member in members.items():
+                if pc_id == self.store.pc_id:
+                    continue
+                saved = records.get(pc_id, {})
+                acknowledged = int(saved.get("revision", 0))
+                online = self.peer_status(pc_id) is not None
+                if acknowledged >= account["revision"]:
+                    status = "Synced"
+                elif not online:
+                    status = "Pending / Offline"
+                elif saved.get("error"):
+                    status = "Error"
+                else:
+                    status = "Synchronizing"
+                sync_peers.append({
+                    "pcId": pc_id, "name": member["name"],
+                    "revision": acknowledged, "status": status,
+                })
+            statuses = {item["status"] for item in sync_peers}
+            account["syncPeers"] = sync_peers
+            account["syncStatus"] = (
+                "Error" if "Error" in statuses else
+                "Pending / Offline" if "Pending / Offline" in statuses else
+                "Synchronizing" if "Synchronizing" in statuses else "Synced"
+            )
+            ownership = ownerships.get(account["customer_id"])
+            retainer = (self.store.retainer_for_login(
+                account["customer_id"], ownership["pc_id"],
+                ownership["login_id"]) if ownership else None)
+            account["retainerInProgress"] = bool(
+                retainer and retainer["state"] in ("prepared", "active"))
+            account["retainerActive"] = bool(
+                retainer and retainer["state"] == "active")
+            account["loggedInPcId"] = ownership["pc_id"] if ownership else ""
+            account["status"] = (
+                "Logged in on " + members.get(ownership["pc_id"], {}).get(
+                    "name", ownership["pc_id"])
+                if ownership else "Not logged in"
+            )
+        selected = next((item for item in accounts
+                         if item["customer_id"] == selected_id), None)
+        normalized_search = " ".join(search.split()).casefold()
+        visible_accounts = [
+            item for item in accounts
+            if not normalized_search or normalized_search in item["name"].casefold()
+        ]
+        return {
+            "accounts": visible_accounts,
+            "selected": selected,
+            "adjustments": (self.store.customer_adjustments(selected_id)
+                            if selected else []),
+        }
+
+    def create_customer(self, name: str, operation_id: str) -> dict:
+        with self.lock:
+            self._require_customer_admin()
+            account = self.store.create_customer(
+                name, self.snapshot()["admin_name"], operation_id)
+        self.notify("changed")
+        return account
+
+    def preview_customer_adjustment(self, customer_id: str, action: str,
+                                    hours: str, minutes: str) -> dict:
+        self._require_customer_admin()
+        if self.store.customer_retainer_in_progress(customer_id):
+            raise RuntimeError(
+                "Balance adjustments are unavailable during an active retainer "
+                "session. End the session before making changes."
+            )
+        if action not in ("add", "reduce"):
+            raise ValueError("Choose Add or Reduce.")
+        seconds = retainer_seconds(hours, minutes)
+        account = self.store.customer_account(customer_id)
+        if not account:
+            raise ValueError("Choose an existing customer.")
+        resulting = (account["balance_seconds"] + seconds if action == "add"
+                     else account["balance_seconds"] - seconds)
+        if resulting < 0:
+            raise ValueError("Retainer balance cannot be reduced below zero.")
+        return {
+            "customerId": customer_id, "name": account["name"],
+            "action": action, "seconds": seconds,
+            "previousBalance": account["balance_seconds"],
+            "resultingBalance": resulting,
+            "revision": account["revision"], "operationId": uuid.uuid4().hex,
+        }
+
+    def adjust_customer(self, preview: dict) -> dict:
+        with self.lock:
+            self._require_customer_admin()
+            account = self.store.adjust_customer_balance(
+                preview["customerId"], preview["action"],
+                int(preview["seconds"]), int(preview["revision"]),
+                int(preview["previousBalance"]), self.snapshot()["admin_name"],
+                preview["operationId"])
+        self.notify("changed")
+        return account
+
+    def delete_customer(self, customer_id: str, exact_name: str,
+                        expected_revision: int, operation_id: str) -> int:
+        with self.lock:
+            self._require_customer_admin()
+            revision = self.store.delete_customer(
+                customer_id, exact_name, expected_revision, operation_id)
+        self.notify("changed")
+        return revision
+
+    def release_customer_ownership(self, customer_id: str) -> None:
+        """Authenticated Admin recovery for an abandoned registered login."""
+        with self.lock:
+            self._require_customer_admin()
+            ownership = self.store.customer_ownership(customer_id=customer_id)
+            if not ownership:
+                return
+            active = self.store.retainer_for_login(
+                customer_id, ownership["pc_id"], ownership["login_id"])
+            if active and active["state"] == "active":
+                self._checkpoint_active_retainers(
+                    force=True, customer_id=customer_id)
+            self._force_retainer_target(active or {
+                "customer_id": customer_id,
+                "pc_id": ownership["pc_id"],
+                "login_id": ownership["login_id"],
+                "balance_seconds": self.store.customer_account(
+                    customer_id)["balance_seconds"],
+            }, logout=True, reason="admin_release")
+            self.store.force_release_customer(customer_id)
+        self.notify("changed")
+
+    def set_customer_cooldown_overrides(
+            self, customer_id: str, retainer_minutes: int | None,
+            login_minutes: int | None, expected_revision: int) -> dict:
+        with self.lock:
+            self._require_customer_admin()
+            account = self.store.set_customer_cooldown_overrides(
+                customer_id, retainer_minutes, login_minutes,
+                expected_revision, self.snapshot()["admin_name"])
+        self.notify("changed")
+        return account
+
+    def clear_customer_cooldown(self, customer_id: str, kind: str) -> dict:
+        with self.lock:
+            self._require_customer_admin()
+            account = self.store.clear_customer_cooldown(
+                customer_id, kind, self.snapshot()["admin_name"])
+        self.notify("changed")
+        return account
+
+    def active_retainer_shutdown_message(self) -> str:
+        active = self.store.active_retainers() if self.is_admin() else []
+        if not active:
+            return (
+                "Exiting disconnects this Admin PC. Existing Guest sessions on "
+                "other User PCs will continue independently."
+            )
+        snap = self.snapshot()
+        names = [snap["members"].get(item["pc_id"], {}).get(
+            "name", item["pc_id"]) for item in active]
+        return (
+            "Exiting disconnects this Admin PC. Active retainer play will be "
+            "stopped and locked on: " + ", ".join(names) + ". Existing Guest "
+            "sessions on other PCs continue independently."
+        )
+
+    @staticmethod
+    def _local_customer_from_state(state: dict,
+                                   feedback: str = "") -> dict:
+        account = state["account"]
+        ownership = state["ownership"]
+        retainer = state.get("retainer") or {}
+        cooldowns = state.get("cooldowns") or {}
+        return {
+            "customer_id": account["customer_id"], "name": account["name"],
+            "login_id": ownership["login_id"],
+            "balance_seconds": account["balance_seconds"],
+            "revision": account["revision"],
+            "retainer_session_id": retainer.get("session_id", ""),
+            "retainer_active": retainer.get("state") == "active",
+            "retainer_state": retainer.get("state", ""),
+            "retainer_display_seconds": int(state.get(
+                "retainer_display_seconds", account["balance_seconds"])),
+            "retainer_display_at": float(state.get(
+                "retainer_display_at", time.time())),
+            "retainer_display_received_monotonic": time.monotonic(),
+            "retainer_finalizing": False,
+            "displayed_at": time.time(), "last_admin_seen": time.time(),
+            "retainer_cooldown_expires_at": int(
+                cooldowns.get("retainer_expires_at", 0)),
+            "login_cooldown_expires_at": int(
+                cooldowns.get("login_expires_at", 0)),
+            "feedback": feedback,
+        }
+
+    def _customer_state_snapshot(self, customer_id: str, pc_id: str,
+                                 login_id: str, now: float) -> dict:
+        """Attach current display metadata without changing the saved balance."""
+        state = self.store.customer_login_state(
+            customer_id, pc_id, login_id, touch_at=now)
+        retainer = state.get("retainer") or {}
+        remaining = int(state["account"]["balance_seconds"])
+        if retainer.get("state") == "active":
+            clock = self.retainer_clocks.get(retainer["session_id"])
+            if clock:
+                remaining = max(
+                    0, remaining - int(max(0, time.monotonic() - clock[0])))
+        state["retainer_display_seconds"] = remaining
+        state["retainer_display_at"] = now
+        return state
+
+    def _customer_admin_request(self, action: str, data: dict) -> dict:
+        payload = {"action": action, **data}
+        if self.is_admin():
+            return self._handle_customer_access(payload, self.store.pc_id)
+        ip = self.active_admin_ip()
+        if not ip or not self.confirmed_remote_admin_online():
+            raise RuntimeError("Admin is offline. Registered access is unavailable.")
+        return self.network.call(ip, "customer_access", payload)
+
+    def _record_customer_auth_failure(self, sender: str,
+                                      customer_id: str) -> None:
+        key, now = (sender, customer_id), time.monotonic()
+        count, blocked_until = self.customer_auth_failures.get(key, (0, 0.0))
+        if blocked_until > now:
+            raise PermissionError(
+                f"Too many attempts. Try again in {max(1, int(blocked_until - now))} seconds."
+            )
+        count += 1
+        self.customer_auth_failures[key] = (
+            0, now + CUSTOMER_AUTH_BLOCK_SECONDS
+        ) if count >= CUSTOMER_AUTH_ATTEMPTS else (count, 0.0)
+
+    def _check_customer_auth_limit(self, sender: str,
+                                   customer_id: str) -> None:
+        _count, blocked_until = self.customer_auth_failures.get(
+            (sender, customer_id), (0, 0.0))
+        now = time.monotonic()
+        if blocked_until > now:
+            raise PermissionError(
+                f"Too many attempts. Try again in {max(1, int(blocked_until - now))} seconds."
+            )
+
+    def _handle_customer_access(self, data: dict, sender: str) -> dict:
+        """Apply registered-customer requests only on the active Admin."""
+        self._require_admin()
+        snap = self.snapshot()
+        if sender not in snap["members"]:
+            raise PermissionError("This PC is not registered in the cafe.")
+        action = str(data.get("action", ""))
+        customer_id = str(data.get("customer_id", ""))
+        now = time.time()
+        if action == "login":
+            self._check_customer_auth_limit(sender, customer_id)
+            if snap["sessions"].get(sender):
+                raise RuntimeError(
+                    "End the current ordinary session before customer login."
+                )
+            try:
+                state = self.store.authenticate_customer(
+                    customer_id, str(data.get("password", "")), sender,
+                    str(data.get("operation_id", "")), now)
+            except PermissionError:
+                self._record_customer_auth_failure(sender, customer_id)
+                raise PermissionError("Customer name or password is incorrect.")
+            self.customer_auth_failures.pop((sender, customer_id), None)
+            self.notify("changed")
+            return state
+
+        login_id = str(data.get("login_id", ""))
+        if action == "state":
+            return self._customer_state_snapshot(
+                customer_id, sender, login_id, now)
+        if action == "password":
+            new_password = str(data.get("new_password", ""))
+            if new_password != str(data.get("confirmation", "")):
+                raise ValueError("New password and confirmation do not match.")
+            account = self.store.change_customer_password(
+                customer_id, sender, login_id,
+                str(data.get("current_password", "")), new_password, now)
+            self.notify("changed")
+            return self._customer_state_snapshot(
+                customer_id, sender, login_id, now)
+        if action == "logout":
+            if snap["sessions"].get(sender):
+                raise RuntimeError(
+                    "End the ordinary gaming session before logging out."
+                )
+            self.store.release_customer_login(
+                customer_id, sender, login_id, record_logout=True, now=now)
+            self.notify("changed")
+            return {"logged_out": True}
+        if action == "retainer_prepare":
+            if snap["sessions"].get(sender):
+                raise RuntimeError(
+                    "End the ordinary gaming session before using retainer time."
+                )
+            retainer = self.store.prepare_retainer(
+                customer_id, sender, login_id,
+                str(data.get("operation_id", "")), now)
+            return {"retainer": retainer}
+        if action == "retainer_activate":
+            retainer = self.store.activate_retainer(
+                str(data.get("session_id", "")), customer_id, sender,
+                login_id, now)
+            # A duplicate activation must not reset the authoritative clock.
+            self.retainer_clocks.setdefault(
+                retainer["session_id"], (time.monotonic(), now))
+            self.notify("changed")
+            return self._customer_state_snapshot(
+                customer_id, sender, login_id, now)
+        if action == "retainer_abort":
+            session_id = str(data.get("session_id", ""))
+            self.store.abort_retainer(session_id, sender, login_id)
+            self.retainer_clocks.pop(session_id, None)
+            return {"aborted": True}
+        if action == "retainer_stop":
+            session_id = str(data.get("session_id", ""))
+            state = self._stop_authoritative_retainer(
+                session_id, customer_id, sender, login_id, "customer")
+            self.notify("changed")
+            return state
+        raise ValueError("Unsupported customer account request.")
+
+    def login_customer(self, customer_id: str, password: str,
+                       operation_id: str) -> dict:
+        if self.store.local_customer_session():
+            raise RuntimeError("A registered customer is already logged in.")
+        snap = self.snapshot()
+        if snap["sessions"].get(self.store.pc_id):
+            raise RuntimeError("End the ordinary session before customer login.")
+        state = self._customer_admin_request("login", {
+            "customer_id": customer_id, "password": password,
+            "operation_id": operation_id,
+        })
+        local = self._local_customer_from_state(state, "Logged in")
+        self.store.save_local_customer_session(local)
+        self.notify("changed")
+        return local
+
+    def change_logged_in_customer_password(
+            self, current_password: str, new_password: str,
+            confirmation: str) -> dict:
+        local = self.store.local_customer_session()
+        if not local:
+            raise PermissionError("Select and log in to a customer account first.")
+        state = self._customer_admin_request("password", {
+            "customer_id": local["customer_id"],
+            "login_id": local["login_id"],
+            "current_password": current_password,
+            "new_password": new_password, "confirmation": confirmation,
+        })
+        updated = self._local_customer_from_state(
+            state, "Password changed successfully")
+        self.store.save_local_customer_session(updated)
+        return updated
+
+    def logout_customer(self) -> None:
+        local = self.store.local_customer_session()
+        if not local:
+            return
+        if local.get("retainer_active"):
+            self.stop_local_retainer()
+            local = self.store.local_customer_session()
+        if self.snapshot()["sessions"].get(self.store.pc_id):
+            raise RuntimeError("End the ordinary session before logging out.")
+        self._customer_admin_request("logout", {
+            "customer_id": local["customer_id"],
+            "login_id": local["login_id"],
+        })
+        self.store.clear_local_customer_session()
+        self.store.set_local("customer_feedback", "Returned to Guest mode.")
+        self._reconcile_local_access()
+
+    def start_local_retainer(self, operation_id: str) -> dict:
+        local = self.store.local_customer_session()
+        if not local:
+            raise PermissionError("Log in to a registered customer account first.")
+        if local.get("retainer_active"):
+            return local
+        if self.snapshot()["sessions"].get(self.store.pc_id):
+            raise RuntimeError(
+                "End the ordinary gaming session before using retainer time."
+            )
+        prepared = self._customer_admin_request("retainer_prepare", {
+            "customer_id": local["customer_id"],
+            "login_id": local["login_id"], "operation_id": operation_id,
+        })["retainer"]
+        self.retainer_unlock_pending = True
+        try:
+            if not self.default_handle:
+                raise RuntimeError("The gaming desktop is unavailable.")
+            switch(self.default_handle)
+            if active_desktop_name() != "Default":
+                raise RuntimeError("The gaming desktop did not unlock.")
+            state = self._customer_admin_request("retainer_activate", {
+                "customer_id": local["customer_id"],
+                "login_id": local["login_id"],
+                "session_id": prepared["session_id"],
+            })
+            updated = self._local_customer_from_state(
+                state, "Retainer play is active")
+            self.store.save_local_customer_session(updated)
+            self.last_access_allowed = True
+            return updated
+        except Exception:
+            try:
+                self._customer_admin_request("retainer_abort", {
+                    "customer_id": local["customer_id"],
+                    "login_id": local["login_id"],
+                    "session_id": prepared["session_id"],
+                })
+            except Exception:
+                pass
+            raise
+        finally:
+            self.retainer_unlock_pending = False
+            if not (self.store.local_customer_session() or {}).get(
+                    "retainer_active"):
+                self._reconcile_local_access()
+
+    def stop_local_retainer(self) -> dict:
+        local = self.store.local_customer_session()
+        if not local or not local.get("retainer_active"):
+            return local or {}
+        if self.console_handle:
+            local["retainer_finalizing"] = True
+            self.store.save_local_customer_session(local)
+            switch(self.console_handle)
+        self.last_access_allowed = False
+        try:
+            state = self._customer_admin_request("retainer_stop", {
+                "customer_id": local["customer_id"],
+                "login_id": local["login_id"],
+                "session_id": local["retainer_session_id"],
+            })
+            updated = self._local_customer_from_state(
+                state, "Retainer stopped; remaining time was saved")
+            self.store.save_local_customer_session(updated)
+            self.store.post_locked_notice(
+                "Retainer Stopped",
+                "Your remaining time has been saved.")
+            return updated
+        except Exception:
+            self._force_local_customer_logout(
+                "Admin unavailable. Retainer play stopped and the account was logged out.")
+            raise
+
+    def _stop_authoritative_retainer(self, session_id: str, customer_id: str,
+                                     pc_id: str, login_id: str,
+                                     reason: str) -> dict:
+        state = self.store.customer_login_state(customer_id, pc_id, login_id)
+        retainer = state.get("retainer")
+        if not retainer or retainer["session_id"] != session_id:
+            raise RuntimeError("Retainer session has changed.")
+        if retainer["state"] == "active":
+            clock = self.retainer_clocks.get(session_id)
+            elapsed = int(max(0, time.monotonic() - clock[0])) if clock else 0
+            self.store.consume_retainer(
+                session_id, elapsed, finalize=True, reason=reason)
+        elif retainer["state"] == "prepared":
+            self.store.abort_retainer(session_id, pc_id, login_id, reason)
+        self.retainer_clocks.pop(session_id, None)
+        return self._customer_state_snapshot(
+            customer_id, pc_id, login_id, time.time())
+
+    def _checkpoint_active_retainers(self, force: bool = False,
+                                     customer_id: str = "") -> None:
+        if not self.is_admin():
+            return
+        now_mono, now_wall = time.monotonic(), time.time()
+        exhausted: list[dict] = []
+        for retainer in self.store.active_retainers():
+            if customer_id and retainer["customer_id"] != customer_id:
+                continue
+            clock = self.retainer_clocks.setdefault(
+                retainer["session_id"], (now_mono, now_wall))
+            elapsed = max(0.0, now_mono - clock[0])
+            if not force and elapsed + SYNC_INTERVAL_SECONDS < RETAINER_CHECKPOINT_SECONDS:
+                continue
+            seconds = int(elapsed)
+            if seconds <= 0:
+                continue
+            result = self.store.consume_retainer(
+                retainer["session_id"], seconds, now=now_wall)
+            self.retainer_clocks[retainer["session_id"]] = (
+                clock[0] + seconds, now_wall)
+            self.notify("changed")
+            if result["exhausted"]:
+                self.retainer_clocks.pop(retainer["session_id"], None)
+                exhausted.append(result["retainer"])
+        for retainer in exhausted:
+            self._force_retainer_target(retainer, logout=False,
+                                        reason="exhausted")
+
+    def _force_retainer_target(self, retainer: dict, logout: bool,
+                               reason: str) -> None:
+        data = {
+            "customer_id": retainer["customer_id"],
+            "login_id": retainer["login_id"],
+            "balance_seconds": int(retainer.get("balance_seconds", 0)),
+            "logout": logout, "reason": reason,
+        }
+        pc_id = retainer["pc_id"]
+        try:
+            if pc_id == self.store.pc_id:
+                self._apply_retainer_control(data)
+                return
+            peer = next((item for item in self.store.peers()
+                         if item["pc_id"] == pc_id), None)
+            if peer and self.peer_status(pc_id):
+                self.network.call(peer["ip"], "retainer_control", data)
+        except Exception:
+            pass  # Heartbeat loss applies the same lock/logout policy shortly.
+
+    def _apply_retainer_control(self, data: dict) -> None:
+        local = self.store.local_customer_session()
+        if not local or (local.get("customer_id") != data.get("customer_id")
+                         or local.get("login_id") != data.get("login_id")):
+            return
+        if data.get("logout"):
+            self._force_local_customer_logout(
+                "Admin ended this registered login. Returned to Guest mode.")
+            return
+        local.update({
+            "balance_seconds": max(0, int(data.get("balance_seconds", 0))),
+            "retainer_active": False, "retainer_state": "stopped",
+            "displayed_at": time.time(), "last_admin_seen": time.time(),
+            "feedback": ("Retainer time exhausted. Ask staff to add time."
+                         if data.get("reason") in ("exhausted", "balance_reduced")
+                         else "Retainer play stopped."),
+        })
+        self.store.save_local_customer_session(local)
+        self.store.set_local("customer_feedback", local["feedback"])
+        self._reconcile_local_access()
+        if data.get("reason") in ("exhausted", "balance_reduced"):
+            self.store.post_locked_notice(
+                "Retainer Time Exhausted",
+                "Your retainer balance has reached zero. Please contact "
+                "staff to add more time.")
+
+    def _force_local_customer_logout(self, message: str) -> None:
+        if self.snapshot()["sessions"].get(self.store.pc_id):
+            self.finish_local_session("interrupted", reconcile_access=False)
+        self.store.clear_local_customer_session()
+        self.store.set_local("customer_feedback", message)
+        self._reconcile_local_access()
 
     def _hold_local_claim(self, term: int) -> None:
         """A local timeout stops a disconnected former Admin from writing."""
@@ -379,10 +1094,11 @@ class Runtime:
 
     def can_become_admin(self) -> bool:
         snap = self.snapshot()
-        return bool(snap and not snap["sessions"].get(self.store.pc_id))
+        return bool(snap and not snap["sessions"].get(self.store.pc_id)
+                    and not self.store.local_customer_session())
 
     def take_admin(self, password: str) -> None:
-        """Authenticate, then transfer from a live Admin or claim locally."""
+        """Authenticate, then log in locally or use the existing live handoff."""
         live_admin = self._find_live_admin()
         snap = self.snapshot()
         if not snap or not verify_password(password, snap["admin_password"]):
@@ -390,6 +1106,8 @@ class Runtime:
         self.admin_signing_key = unlock_admin_signing_key(
             password, snap["admin_signing"]
         )
+        if self._resume_pending_admin_handoff():
+            return
         if not self.can_become_admin():
             raise RuntimeError("End this PC's customer session before switching to Admin.")
         if live_admin:
@@ -407,17 +1125,171 @@ class Runtime:
         term = max(int(snap["active_admin"].get("term", 0)),
                    int(self.store.local(self._lease_key("term")) or 0)) + 1
         challenge = self.network.call(ip, "lease_challenge", {})["challenge"]
-        proof = {"pool_id": snap["pool_id"], "candidate": self.store.pc_id,
-                 "term": term, "challenge": challenge}
-        reply = self.network.call(ip, "transfer_admin", {
-            "proof": proof, "signature": sign_admin_proof(self.admin_signing_key, proof)
-        })
-        self.accept_admin_snapshot(reply["snapshot"], previous)
+        transfer_id = uuid.uuid4().hex
+        recipient_private, recipient_public = create_handoff_keypair()
+        context = {
+            "pool_id": snap["pool_id"], "source_admin": previous,
+            "candidate": self.store.pc_id, "term": term,
+            "transfer_id": transfer_id, "challenge": challenge,
+        }
+        proof = {**context, "recipient_public": recipient_public}
+        prepared = False
+        committed = False
+        try:
+            reply = self.network.call(ip, "prepare_admin_transfer", {
+                "proof": proof,
+                "signature": sign_admin_proof(self.admin_signing_key, proof),
+            })
+            prepared = True
+            manifest = reply.get("manifest", {})
+            ciphertext_bytes = int(manifest.get("ciphertext_bytes", 0))
+            expected_chunks = (
+                ciphertext_bytes * 2 + HANDOFF_CHUNK_HEX_LENGTH - 1
+            ) // HANDOFF_CHUNK_HEX_LENGTH
+            if (not isinstance(manifest, dict)
+                    or manifest.get("context") != context
+                    or ciphertext_bytes < 16
+                    or ciphertext_bytes > MAX_HANDOFF_PLAINTEXT + 16
+                    or int(manifest.get("chunk_count", 0)) != expected_chunks):
+                raise ValueError("Admin handoff manifest is invalid.")
+            chunks = []
+            for index in range(int(manifest["chunk_count"])):
+                part = self.network.call(ip, "admin_transfer_chunk", {
+                    "transfer_id": transfer_id, "index": index})
+                chunk = part.get("chunk")
+                if (not isinstance(chunk, str)
+                        or len(chunk) > HANDOFF_CHUNK_HEX_LENGTH):
+                    raise ValueError("Admin handoff chunk is invalid.")
+                chunks.append(chunk)
+            ciphertext = "".join(chunks)
+            if (len(ciphertext) != int(manifest["ciphertext_bytes"]) * 2
+                    or hashlib.sha256(bytes.fromhex(ciphertext)).hexdigest()
+                    != manifest.get("ciphertext_digest")):
+                raise ValueError("Encrypted Admin handoff is incomplete or corrupt.")
+            bundle = open_admin_handoff(recipient_private, context, {
+                "sender_public": manifest.get("sender_public"),
+                "nonce": manifest.get("nonce"), "ciphertext": ciphertext,
+            })
+            saved_digest = self.store.apply_authoritative_handoff_bundle(
+                bundle, previous, self.store.pc_id, term, transfer_id)
+            if saved_digest != manifest.get("state_digest"):
+                raise RuntimeError("Admin handoff durable verification failed.")
+            self.store.set_local(self._pending_handoff_key(), json.dumps({
+                "source_admin": previous, "source_ip": ip, "term": term,
+                "transfer_id": transfer_id,
+            }, separators=(",", ":")))
+            claim = {"pool_id": snap["pool_id"],
+                     "candidate": self.store.pc_id, "term": term}
+            try:
+                commit = self.network.call(ip, "commit_admin_transfer", {
+                    "transfer_id": transfer_id, "state_digest": saved_digest,
+                    "claim": claim,
+                    "claim_signature": sign_admin_proof(
+                        self.admin_signing_key, claim),
+                })
+                committed_snapshot = commit["snapshot"]
+            except Exception as error:
+                committed_snapshot = self._resolve_handoff_commit(
+                    ip, previous, term, transfer_id, error)
+            self._complete_committed_handoff(
+                committed_snapshot, previous, term, transfer_id)
+            committed = True
+        finally:
+            if prepared and not committed:
+                pending = self.store.local(self._pending_handoff_key())
+                if not pending:
+                    try:
+                        self.network.call(ip, "abort_admin_transfer", {
+                            "transfer_id": transfer_id})
+                    except Exception:
+                        pass
+
+    def _pending_handoff_key(self) -> str:
+        return f"pending_admin_handoff:{self.store.current_pool_id or 'none'}"
+
+    def _complete_committed_handoff(self, snapshot: dict, source_admin: str,
+                                    term: int, transfer_id: str) -> None:
+        current = self.snapshot()
+        claim = snapshot.get("active_admin", {})
+        proof = {"pool_id": current["pool_id"],
+                 "candidate": self.store.pc_id, "term": int(term)}
+        if (snapshot.get("pool_id") != current["pool_id"]
+                or source_admin not in current["members"]
+                or claim.get("pc_id") != self.store.pc_id
+                or int(claim.get("term", -1)) != int(term)
+                or claim.get("handoff_id") != transfer_id):
+            raise PermissionError("Committed Admin handoff is invalid.")
+        verify_admin_proof(current["admin_signing"]["public"], proof,
+                           claim.get("proof", ""))
+        self.store.apply_snapshot(snapshot, follow_live_admin=True)
+        def refresh_committed_claim(state):
+            active = state["active_admin"]
+            if (active.get("pc_id") != self.store.pc_id
+                    or int(active.get("term", -1)) != int(term)
+                    or active.get("handoff_id") != transfer_id):
+                raise RuntimeError("Committed Admin authority changed before activation.")
+            active["expires_at"] = time.time() + LEASE_SECONDS
+
+        self.store.update(refresh_committed_claim)
         self._hold_local_claim(term)
-        self._activate_admin(term)
+        self.store.delete_local(self._pending_handoff_key())
+        self.admin_ui_open = True
+        self.notify("admin_ready")
+        self._replicate_once()
+
+    def _resolve_handoff_commit(self, ip: str, source_admin: str, term: int,
+                                transfer_id: str, original_error: Exception) -> dict:
+        try:
+            snapshot = self.network.call(ip, "snapshot", {})["snapshot"]
+        except Exception as query_error:
+            raise RuntimeError(
+                "Admin transfer outcome could not be confirmed. Authoritative "
+                "changes remain disabled until the previous Admin reconnects."
+            ) from query_error
+        claim = snapshot.get("active_admin", {})
+        if (claim.get("pc_id") == self.store.pc_id
+                and int(claim.get("term", -1)) == int(term)
+                and claim.get("handoff_id") == transfer_id):
+            return snapshot
+        self.store.delete_local(self._pending_handoff_key())
+        try:
+            self.network.call(ip, "abort_admin_transfer", {
+                "transfer_id": transfer_id})
+        except Exception:
+            pass
+        raise original_error
+
+    def _resume_pending_admin_handoff(self) -> bool:
+        raw = self.store.local(self._pending_handoff_key())
+        if not raw:
+            return False
+        try:
+            pending = json.loads(raw)
+            source = str(pending["source_admin"])
+            term = int(pending["term"])
+            transfer_id = str(pending["transfer_id"])
+            ip = str(pending.get("source_ip", ""))
+            if not ip:
+                ip = next(item["ip"] for item in self.store.peers()
+                          if item["pc_id"] == source)
+            snapshot = self.network.call(ip, "snapshot", {})["snapshot"]
+        except Exception as error:
+            raise RuntimeError(
+                "A previous Admin transfer is unresolved. Reconnect the previous "
+                "Admin before retrying."
+            ) from error
+        claim = snapshot.get("active_admin", {})
+        if (claim.get("pc_id") == self.store.pc_id
+                and int(claim.get("term", -1)) == term
+                and claim.get("handoff_id") == transfer_id):
+            self._complete_committed_handoff(
+                snapshot, source, term, transfer_id)
+            return True
+        self.store.delete_local(self._pending_handoff_key())
+        return False
 
     def login_admin_with_unlocked_key(self) -> None:
-        """Use a local claim when no reachable Admin responds."""
+        """Only the saved Admin Node can renew its own designation locally."""
         if not self.can_become_admin():
             raise RuntimeError("A PC with an active customer session cannot be Admin.")
         if self.admin_signing_key is None:
@@ -429,6 +1301,11 @@ class Runtime:
         if self._find_live_admin():
             raise RuntimeError("An active Admin is online; use Switch to Admin to transfer.")
         snap = self.snapshot()
+        if snap["active_admin"].get("pc_id") != self.store.pc_id:
+            raise RuntimeError("The designated Admin Node is offline; Admin transfer requires it to be online.")
+        if int(self.store.local(self._lease_key("handed_off")) or 0) >= \
+                int(snap["active_admin"].get("term", 0)):
+            raise RuntimeError("This PC handed off Admin control; reconnect to the current Admin Node.")
         term = max(int(snap["active_admin"].get("term", 0)),
                    int(self.store.local(self._lease_key("term")) or 0)) + 1
         self._hold_local_claim(term)
@@ -546,6 +1423,11 @@ class Runtime:
                 if option not in ("recent", "name"):
                     raise ValueError("Unknown computer sorting option.")
                 state["settings"]["computer_sort"] = option
+            elif action == "customer_access_settings":
+                state["settings"]["retainer_restart_cooldown_minutes"] = \
+                    validate_cooldown_minutes(details["retainer_minutes"])
+                state["settings"]["customer_login_cooldown_minutes"] = \
+                    validate_cooldown_minutes(details["login_minutes"])
             elif action == "password":
                 state["admin_password"] = hash_password(details["new_password"])
                 state["admin_signing"] = create_admin_signing_record(
@@ -567,11 +1449,30 @@ class Runtime:
         self._reconcile_local_access()
         return updated
 
+    def set_locked_wallpaper(self, content: bytes, media_type: str) -> dict:
+        with self.lock:
+            self._require_customer_admin()
+            metadata = self.store.set_wallpaper(content, media_type)
+        self.notify("changed")
+        return metadata
+
+    def reset_locked_wallpaper(self) -> None:
+        with self.lock:
+            self._require_customer_admin()
+            self.store.reset_wallpaper()
+        self.notify("changed")
+
     def _remote_session_action(self, action: str, pc_id: str,
                                details: dict) -> dict:
         with self.lock:
             self._require_admin()
             snap = self.snapshot()
+            customer_state = self.customer_pc_states().get(pc_id, {})
+            if customer_state.get("retainerActive") and action in (
+                    "start", "add", "pause", "resume"):
+                raise RuntimeError(
+                    "Stop this PC's retainer session before ordinary session controls."
+                )
             peer = next((p for p in self.store.peers() if p["pc_id"] == pc_id), None)
             if not peer or time.time() - peer["last_seen"] > PEER_ONLINE_SECONDS:
                 raise RuntimeError("Target PC is offline; session control is unavailable.")
@@ -706,27 +1607,17 @@ class Runtime:
         if (reply.get("target") != pc_id or not reply.get("accepted")
                 or not reply.get("session_finalized")):
             raise RuntimeError("Target did not confirm session finalization and exit acceptance.")
+        self._record_graceful_disconnect(pc_id)
         # The process is still sending this reply; offline status follows disconnect.
         return reply
 
     def submit_customer_action(self, action: str, **details) -> None:
         """Ask the active Admin to perform a customer-originated write."""
-        if action in ("end", "rename"):
-            if action == "end":
-                self.finish_local_session("customer")
-            else:
-                name = str(details["name"]).strip()
-                if not 1 <= len(name) <= 40:
-                    raise ValueError("Player name must be 1 to 40 characters.")
-                with self.lock:
-                    if self.local_shutdown_pending:
-                        raise RuntimeError("This PC is closing; session changes are unavailable.")
-                    session, history, grants = self._owner_payload()
-                    if not session:
-                        raise ValueError("No active session.")
-                    session["player"] = name
-                    self._save_owner_state(session, history, grants)
+        if action == "end":
+            self.finish_local_session("customer")
             return
+        if action == "rename":
+            raise ValueError("Guest and registered customer names cannot be edited here.")
         if self.is_admin():
             self._customer_action(action, details, self.store.pc_id)
             return
@@ -758,11 +1649,19 @@ class Runtime:
             if action == "start":
                 if session:
                     raise ValueError("This PC already has a session.")
+                if (self.store.local_customer_session() or {}).get(
+                        "retainer_active"):
+                    raise RuntimeError(
+                        "Stop retainer play before starting an ordinary session."
+                    )
                 kind = str(details.get("kind", ""))
                 paid, buffer = validate_start(
                     kind, str(details.get("paid_minutes", "")),
                     str(details.get("buffer_minutes", "")))
                 session = sessions.start_session(kind, paid, buffer)
+                customer = self.store.local_customer_session()
+                if customer:
+                    session["player"] = customer["name"]
                 command_details = {"kind": kind, "paid_minutes": paid,
                                    "buffer_minutes": buffer,
                                    "source": "local_staff"}
@@ -849,10 +1748,17 @@ class Runtime:
             if action == "start":
                 if session:
                     raise ValueError("This PC already has a session.")
+                customer = self.store.local_customer_session()
+                if (customer or {}).get("retainer_active"):
+                    raise RuntimeError(
+                        "Stop retainer play before starting an ordinary session."
+                    )
                 session = sessions.start_session(details["kind"],
                     int(details.get("paid_minutes", 0)),
                     int(details.get("buffer_minutes", 0)))
                 session["id"] = command["session_id"]
+                if customer:
+                    session["player"] = customer["name"]
             else:
                 if not session or command["session_id"] != session["id"]:
                     raise ValueError("Session has changed; refresh the dashboard.")
@@ -891,34 +1797,47 @@ class Runtime:
             name = str(data.get("name", ""))[:40]
             public_key = str(data.get("public_key", ""))
             pairing_public = str(data.get("pairing_public", ""))
+            verification_code = str(data.get("verification_code", ""))
+            cancel_token = str(data.get("cancel_token", ""))
             if (len(request_id) != 32 or len(pc_id) != 32
                     or len(public_key) != 64 or len(pairing_public) != 64
+                    or not re.fullmatch(r"\d{6}", verification_code)
+                    or not re.fullmatch(r"[0-9a-f]{64}", cancel_token)
                     or not name.strip()):
                 raise ValueError("Invalid join request.")
             bytes.fromhex(public_key)
             bytes.fromhex(pairing_public)
+            private, admin_public = create_pairing_key()
+            shared = pairing_secret(private, pairing_public)
+            verification_digest = hmac.new(
+                shared,
+                f"verify:{request_id}:{verification_code}".encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            cancel_digest = hmac.new(
+                shared,
+                f"cancel:{request_id}:{cancel_token}".encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
             self.store.record_join(request_id, pc_id, name, ip, public_key,
-                                   pairing_public)
+                                   pairing_public, admin_public, shared.hex(),
+                                   verification_digest, cancel_digest)
             self.notify("join_request")
-            return {"state": "pending"}
+            return {"state": "pending", "pairing_admin_public": admin_public}
         if operation == "join_poll":
             request_id = str(data.get("request_id", ""))
             decision = self.store.join_decision(request_id)
             if not decision:
                 raise ValueError("Unknown join request.")
             return decision
+        if operation == "join_cancel":
+            cancelled = self.store.cancel_join(
+                str(data.get("request_id", "")),
+                str(data.get("pc_id", "")),
+                str(data.get("cancel_token", "")),
+            )
+            return {"state": "cancelled" if cancelled else "inactive"}
         raise ValueError("Unsupported public request.")
-
-    def prepare_join_pairing(self, request_id: str) -> None:
-        """Publish an ephemeral public key so the joining PC can show its code."""
-        self._require_admin()
-        pending = next((item for item in self.store.pending_joins()
-                        if item["request_id"] == request_id), None)
-        if not pending:
-            raise ValueError("Join request expired or is no longer pending.")
-        private, admin_public = create_pairing_key()
-        shared = pairing_secret(private, pending["pairing_public"])
-        self.store.set_join_pairing(request_id, admin_public, shared.hex())
 
     def approve_join(self, request_id: str, pc_id: str,
                      verification_code: str, name: str) -> None:
@@ -927,12 +1846,8 @@ class Runtime:
                         if item["request_id"] == request_id and item["pc_id"] == pc_id), None)
         if not pending:
             raise ValueError("Join request is no longer pending.")
-        if not pending["pairing_secret"]:
-            raise RuntimeError("Pairing has not started; choose Accept again.")
-        shared = bytes.fromhex(pending["pairing_secret"])
-        expected = pairing_code(shared, request_id)
         shared = bytes.fromhex(self.store.verify_join_code(
-            request_id, pc_id, verification_code.strip().upper(), expected
+            request_id, pc_id, verification_code.strip()
         ))
         name = name.strip()
         if not name or len(name) > 40:
@@ -965,6 +1880,12 @@ class Runtime:
             if record["payload"]["pc_id"] != sender:
                 raise PermissionError("Only an owner can publish its session record.")
             return {"applied": self.store.merge_owner_record(record)}
+        if operation == "graceful_shutdown":
+            self._require_admin()
+            if sender == self.store.pc_id or sender not in snap["members"]:
+                raise PermissionError("Only a registered User PC can close remotely.")
+            self._record_graceful_disconnect(sender)
+            return {"recorded": True}
         if operation == "session_command":
             return self._apply_session_command(data, sender)
         if operation == "remote_exit":
@@ -987,7 +1908,7 @@ class Runtime:
                 }
                 self.lease_challenges[(sender, challenge)] = now + 10
             return {"challenge": challenge}
-        if operation == "transfer_admin":
+        if operation == "prepare_admin_transfer":
             with self.lock:
                 self._require_admin()
                 snap = self.snapshot()
@@ -995,20 +1916,145 @@ class Runtime:
                 if (proof.get("candidate") != sender
                         or proof.get("pool_id") != snap["pool_id"]
                         or int(proof.get("term", 0)) <= snap["active_admin"]["term"]
-                        or snap["sessions"].get(sender)):
+                        or snap["sessions"].get(sender)
+                        or self.store.customer_ownerships()):
                     raise PermissionError("PC is not eligible for Admin transfer.")
+                transfer_id = str(proof.get("transfer_id", ""))
+                recipient_public = str(proof.get("recipient_public", ""))
+                expected_context = {
+                    "pool_id": snap["pool_id"],
+                    "source_admin": self.store.pc_id,
+                    "candidate": sender, "term": int(proof["term"]),
+                    "transfer_id": transfer_id,
+                    "challenge": proof.get("challenge"),
+                }
+                existing = self.handoff_transfer
+                if (existing and existing.get("transfer_id") == transfer_id
+                        and existing.get("candidate") == sender
+                        and existing.get("expires_at", 0) > time.time()):
+                    return {"manifest": existing["manifest"]}
+                if existing:
+                    raise RuntimeError("Another Admin transfer is already in progress.")
+                if (len(transfer_id) != 32 or len(recipient_public) != 64
+                        or set(proof) != set(expected_context) | {"recipient_public"}):
+                    raise ValueError("Admin handoff proof is invalid.")
                 challenge = proof.get("challenge")
                 expiry = self.lease_challenges.pop((sender, challenge), 0)
                 if expiry <= time.time():
                     raise PermissionError("Admin transfer challenge expired.")
                 verify_admin_proof(snap["admin_signing"]["public"], proof,
                                    data.get("signature", ""))
-                # Stop Admin writes before the new PC claims the role.
+                # Install the barrier before reading any authoritative tables.
+                self.handoff_transfer = {
+                    "transfer_id": transfer_id, "candidate": sender,
+                    "term": int(proof["term"]), "expires_at": time.time()
+                    + HANDOFF_EXPIRY_SECONDS, "manifest": None,
+                    "chunks": [], "state_digest": "",
+                    "committed_snapshot": None,
+                }
+                try:
+                    bundle = self.store.authoritative_handoff_bundle(
+                        self.store.pc_id, sender, int(proof["term"]),
+                        transfer_id)
+                    plaintext_size = len(json.dumps(
+                        bundle, sort_keys=True,
+                        separators=(",", ":")).encode("utf-8"))
+                    if plaintext_size > MAX_HANDOFF_PLAINTEXT:
+                        raise ValueError(
+                            "Admin handoff data exceeds the safe transfer limit.")
+                    package = seal_admin_handoff(
+                        recipient_public, expected_context, bundle)
+                    ciphertext = package.pop("ciphertext")
+                    chunks = [
+                        ciphertext[index:index + HANDOFF_CHUNK_HEX_LENGTH]
+                        for index in range(
+                            0, len(ciphertext), HANDOFF_CHUNK_HEX_LENGTH)
+                    ]
+                    manifest = {
+                        "context": expected_context,
+                        "sender_public": package["sender_public"],
+                        "nonce": package["nonce"],
+                        "chunk_count": len(chunks),
+                        "ciphertext_bytes": len(ciphertext) // 2,
+                        "ciphertext_digest": hashlib.sha256(
+                            bytes.fromhex(ciphertext)).hexdigest(),
+                        "state_digest": bundle["state_digest"],
+                    }
+                    self.handoff_transfer.update({
+                        "expires_at": time.time() + HANDOFF_EXPIRY_SECONDS,
+                        "manifest": manifest, "chunks": chunks,
+                        "state_digest": bundle["state_digest"],
+                    })
+                except Exception:
+                    self.handoff_transfer = None
+                    raise
+                return {"manifest": manifest}
+        if operation == "admin_transfer_chunk":
+            with self.lock:
+                self._require_admin(allow_handoff=True)
+                transfer = self.handoff_transfer or {}
+                index = data.get("index")
+                if (transfer.get("candidate") != sender
+                        or transfer.get("transfer_id") != data.get("transfer_id")
+                        or transfer.get("expires_at", 0) <= time.time()
+                        or isinstance(index, bool) or not isinstance(index, int)
+                        or not 0 <= index < len(transfer.get("chunks", []))):
+                    raise PermissionError("Admin handoff chunk request is invalid.")
+                return {"chunk": transfer["chunks"][index]}
+        if operation == "commit_admin_transfer":
+            with self.lock:
+                transfer_id = str(data.get("transfer_id", ""))
+                current = self.snapshot()
+                active = current["active_admin"]
+                if (active.get("pc_id") == sender
+                        and active.get("handoff_id") == transfer_id):
+                    return {"snapshot": current}
+                self._require_admin(allow_handoff=True)
+                transfer = self.handoff_transfer or {}
+                claim = data.get("claim", {})
+                if (transfer.get("candidate") != sender
+                        or transfer.get("transfer_id") != transfer_id
+                        or transfer.get("expires_at", 0) <= time.time()
+                        or transfer.get("state_digest") != data.get("state_digest")
+                        or claim != {"pool_id": current["pool_id"],
+                                     "candidate": sender,
+                                     "term": transfer.get("term")}
+                        or self.store.customer_ownerships()):
+                    raise PermissionError("Admin handoff is not ready to commit.")
+                verify_admin_proof(current["admin_signing"]["public"], claim,
+                                   data.get("claim_signature", ""))
+
+                def commit(state):
+                    if state["active_admin"].get("pc_id") != self.store.pc_id:
+                        raise RuntimeError("Admin authority changed before commit.")
+                    state["active_admin"] = {
+                        "pc_id": sender, "term": transfer["term"],
+                        "expires_at": time.time() + LEASE_SECONDS,
+                        "proof": data["claim_signature"],
+                        "handoff_id": transfer_id,
+                    }
+
+                committed = self.store.update(commit)
+                transfer["committed_snapshot"] = committed
                 self.handoff_until = time.time() + 30
+                self.store.set_local(self._lease_key("handed_off"),
+                                     str(active["term"]))
                 self.store.set_local(self._lease_key("until"), "0")
                 self.admin_ui_open = False
                 self.notify("role_lost")
-                return {"snapshot": snap}
+                return {"snapshot": committed}
+        if operation == "abort_admin_transfer":
+            with self.lock:
+                transfer = self.handoff_transfer
+                if not transfer:
+                    return {"aborted": True}
+                if (transfer.get("candidate") != sender
+                        or transfer.get("transfer_id") != data.get("transfer_id")):
+                    raise PermissionError("Admin handoff abort is invalid.")
+                if transfer.get("committed_snapshot") is not None:
+                    return {"aborted": False}
+                self.handoff_transfer = None
+                return {"aborted": True}
         if operation == "push_snapshot":
             incoming = data.get("snapshot")
             if not isinstance(incoming, dict) or incoming.get("pool_id") != snap["pool_id"]:
@@ -1021,34 +2067,97 @@ class Runtime:
             self._reconcile_local_access()
             return {"revision": self.snapshot()["revision"], "applied": applied,
                     "admin_rank": admin_rank(self.snapshot()),
-                    "access_ready": self._local_access_ready()}
+                    "access_ready": self._local_access_ready(),
+                    "wallpaper_id": self.store.current_wallpaper_id()}
+        if operation == "wallpaper_sync":
+            claim = self.snapshot()["active_admin"]
+            if (sender != claim.get("pc_id") or
+                    claim.get("expires_at", 0) <= time.time()):
+                raise PermissionError(
+                    "Only the active Admin can synchronize the locked wallpaper."
+                )
+            metadata = data.get("metadata")
+            encoded = data.get("content")
+            if not isinstance(metadata, dict) or not isinstance(encoded, str):
+                raise ValueError("Invalid wallpaper synchronization payload.")
+            try:
+                content = base64.b64decode(encoded, validate=True)
+            except (ValueError, TypeError) as error:
+                raise ValueError("Invalid wallpaper image encoding.") from error
+            wallpaper_id = self.store.apply_wallpaper(metadata, content)
+            self.notify("changed")
+            return {"wallpaper_id": wallpaper_id}
+        if operation == "customer_sync":
+            claim = snap["active_admin"]
+            if (sender != claim.get("pc_id") or
+                    claim.get("expires_at", 0) <= time.time()):
+                raise PermissionError(
+                    "Only the active Admin can synchronize customer accounts."
+                )
+            accounts = data.get("accounts", [])
+            tombstones = data.get("tombstones", [])
+            if not isinstance(accounts, list) or not isinstance(tombstones, list):
+                raise ValueError("Invalid customer synchronization payload.")
+            acknowledgments = self.store.apply_customer_replica(
+                accounts, tombstones)
+            self.notify("changed")
+            return {"acknowledgments": acknowledgments}
+        if operation == "customer_access":
+            with self.lock:
+                return self._handle_customer_access(data, sender)
+        if operation == "retainer_control":
+            claim = snap["active_admin"]
+            if (sender != claim.get("pc_id") or
+                    claim.get("expires_at", 0) <= time.time()):
+                raise PermissionError(
+                    "Only the active Admin can stop registered customer access."
+                )
+            self._apply_retainer_control(data)
+            return {"target": self.store.pc_id,
+                    "locked": not self._local_access_ready()}
         if operation == "customer_action":
             self._customer_action(data["action"], data.get("details", {}), sender)
             return {"revision": self.snapshot()["revision"]}
         raise ValueError("Unsupported member request.")
 
-    def request_join(self, ip: str, pool_id: str, requested_name: str):
-        """Send a join request and retain the private half only on this PC."""
+    def prepare_join_request(self, pool_id: str, requested_name: str) -> dict:
+        """Create the visible code locally before any network round trip."""
         private, public = create_pairing_key()
         request_id = uuid.uuid4().hex
-        plain_call(ip, "join_request", {"pool_id": pool_id,
-                                        "pc_id": self.store.pc_id,
-                                        "request_id": request_id,
-                                        "name": requested_name,
-                                        "public_key": self.store.node_public_key(),
-                                        "pairing_public": public})
-        return request_id, private
+        code = f"{secrets.randbelow(1_000_000):06d}"
+        cancel_token = secrets.token_hex(32)
+        return {
+            "request_id": request_id, "private": private, "code": code,
+            "cancel_token": cancel_token,
+            "payload": {"pool_id": pool_id, "pc_id": self.store.pc_id,
+                        "request_id": request_id, "name": requested_name,
+                        "public_key": self.store.node_public_key(),
+                        "pairing_public": public,
+                        "verification_code": code,
+                        "cancel_token": cancel_token},
+        }
+
+    def send_join_request(self, ip: str, request: dict) -> None:
+        reply = plain_call(ip, "join_request", request["payload"])
+        request["admin_public"] = reply["pairing_admin_public"]
+
+    def request_join(self, ip: str, pool_id: str, requested_name: str):
+        request = self.prepare_join_request(pool_id, requested_name)
+        self.send_join_request(ip, request)
+        return request
+
+    def cancel_join(self, ip: str, request_id: str, cancel_token: str) -> None:
+        plain_call(ip, "join_cancel", {
+            "request_id": request_id, "pc_id": self.store.pc_id,
+            "cancel_token": cancel_token,
+        })
 
     def finish_join(self, ip: str, request_id: str, pairing_private,
                     old_pool_id: str | None = None) -> tuple[str, str | None]:
         reply = plain_call(ip, "join_poll", {"request_id": request_id})
         if reply["state"] == "pending":
-            public = reply.get("pairing_admin_public")
-            if public:
-                shared = pairing_secret(pairing_private, public)
-                return "verify", pairing_code(shared, request_id)
             return "pending", None
-        if reply["state"] in ("rejected", "expired"):
+        if reply["state"] in ("rejected", "expired", "cancelled"):
             return reply["state"], None
         shared = pairing_secret(pairing_private, reply["pairing_admin_public"])
         welcome = open_welcome(shared, request_id, reply["sealed_welcome"])
@@ -1096,18 +2205,49 @@ class Runtime:
                  and peer["pc_id"] != self.store.pc_id]
         if not peers:
             return
+        customer_payload = self.store.customer_replica_payload()
+        wallpaper = self.store.wallpaper_content()
+
+        def push(peer: dict) -> tuple[dict, dict]:
+            pool_reply = self.network.call(
+                peer["ip"], "push_snapshot", {"snapshot": snap})
+            if (wallpaper and
+                    pool_reply.get("wallpaper_id") != wallpaper[0]["id"]):
+                wallpaper_reply = self.network.call(
+                    peer["ip"], "wallpaper_sync", {
+                        "metadata": wallpaper[0],
+                        "content": base64.b64encode(wallpaper[1]).decode("ascii"),
+                    })
+                if wallpaper_reply.get("wallpaper_id") != wallpaper[0]["id"]:
+                    raise RuntimeError("Peer did not save the locked wallpaper.")
+            customer_reply = self.network.call(
+                peer["ip"], "customer_sync", customer_payload)
+            return pool_reply, customer_reply
+
+        expected = {
+            item["customer_id"]: int(item["revision"])
+            for item in customer_payload["accounts"] + customer_payload["tombstones"]
+        }
         with ThreadPoolExecutor(max_workers=min(8, len(peers))) as executor:
-            futures = {executor.submit(self.network.call, peer["ip"],
-                                       "push_snapshot", {"snapshot": snap}): peer
+            futures = {executor.submit(push, peer): peer
                        for peer in peers}
             for future in as_completed(futures):
                 peer = futures[future]
                 try:
-                    reply = future.result()
+                    reply, customer_reply = future.result()
                     self.store.note_peer(peer["pc_id"], peer["ip"],
                                          int(reply["revision"]))
-                except Exception:
-                    pass  # The next sync pass retries a full snapshot.
+                    acknowledgments = customer_reply.get("acknowledgments", {})
+                    if not isinstance(acknowledgments, dict) or any(
+                            int(acknowledgments.get(customer_id, -1)) < revision
+                            for customer_id, revision in expected.items()):
+                        raise RuntimeError(
+                            "Peer did not acknowledge durable customer revisions."
+                        )
+                    self.store.note_customer_sync(peer["pc_id"], acknowledgments)
+                except Exception as error:
+                    self.store.note_customer_sync(peer["pc_id"], {}, str(error))
+                    # The next sync pass retries both pool and customer state.
 
     def _poll_peer_statuses(self) -> None:
         snap = self.snapshot()
@@ -1133,9 +2273,13 @@ class Runtime:
                     with self.lock:
                         self.peer_statuses[item["pc_id"]] = (time.time(), status)
                     previous = self.connection_states.get(item["pc_id"])
-                    self.connection_states[item["pc_id"]] = True
-                    if previous is False and self.is_admin():
+                    if item["pc_id"] not in self.graceful_disconnects:
+                        self.connection_states[item["pc_id"]] = True
+                    if (previous is False
+                            and item["pc_id"] not in self.graceful_disconnects
+                            and self.is_admin()):
                         self._record_member_connection(item["pc_id"])
+                        self._record_peer_notification(item["pc_id"], "online")
                     records = self.network.call(item["ip"], "session_records", {})["records"]
                     for record in records:
                         if self.store.merge_owner_record(record):
@@ -1145,7 +2289,50 @@ class Runtime:
         for item in peers:
             pc_id = item["pc_id"]
             if pc_id not in successful and self.peer_status(pc_id) is None:
+                previous = self.connection_states.get(pc_id)
+                graceful = pc_id in self.graceful_disconnects
+                self.graceful_disconnects.discard(pc_id)
                 self.connection_states[pc_id] = False
+                if previous is True and not graceful and self.is_admin():
+                    self._record_peer_notification(pc_id, "offline")
+                    self._release_disconnected_customer(pc_id, "pc_offline")
+
+    def _record_peer_notification(self, pc_id: str, event_type: str) -> None:
+        """Snapshot the event-time name while retaining the immutable PC ID."""
+        snap = self.snapshot()
+        member = snap.get("members", {}).get(pc_id) if snap else None
+        if not member:
+            return
+        self.store.add_notification(pc_id, member.get("name", "PC"), event_type)
+        self.notify("changed")
+
+    def _record_graceful_disconnect(self, pc_id: str) -> None:
+        """Record one close and suppress the later heartbeat-offline duplicate."""
+        if pc_id in self.graceful_disconnects:
+            return
+        self._record_peer_notification(pc_id, "closed")
+        self._release_disconnected_customer(pc_id, "software_closed")
+        self.graceful_disconnects.add(pc_id)
+        self.connection_states[pc_id] = False
+
+    def _release_disconnected_customer(self, pc_id: str, reason: str) -> bool:
+        """Invalidate one disconnected PC's login without starting a cooldown."""
+        with self.lock:
+            if not self.is_admin():
+                return False
+            ownership = self.store.customer_ownership(pc_id=pc_id)
+            if not ownership:
+                return False
+            retainer = self.store.retainer_for_login(
+                ownership["customer_id"], pc_id, ownership["login_id"])
+            if retainer:
+                # Preserve the last durable checkpoint; detection latency is
+                # offline time and must not be charged to the customer.
+                self.retainer_clocks.pop(retainer["session_id"], None)
+            self.store.force_release_customer(
+                ownership["customer_id"], reason=reason)
+        self.notify("changed")
+        return True
 
     def _record_member_connection(self, pc_id: str,
                                   connected_at: float | None = None) -> None:
@@ -1185,6 +2372,83 @@ class Runtime:
                 return
             except Exception:
                 continue
+
+    def customer_pc_states(self) -> dict[str, dict]:
+        """Return Admin-authoritative registered presence keyed by immutable PC ID."""
+        if not self.is_admin():
+            return {}
+        result: dict[str, dict] = {}
+        now_mono = time.monotonic()
+        for ownership in self.store.customer_ownerships():
+            account = self.store.customer_account(ownership["customer_id"])
+            if not account:
+                continue
+            retainer = self.store.retainer_for_login(
+                ownership["customer_id"], ownership["pc_id"],
+                ownership["login_id"])
+            active = bool(retainer and retainer["state"] == "active")
+            balance = account["balance_seconds"]
+            if active:
+                clock = self.retainer_clocks.get(retainer["session_id"])
+                if clock:
+                    balance = max(0, balance - int(max(0, now_mono - clock[0])))
+            result[ownership["pc_id"]] = {
+                "customerId": account["customer_id"],
+                "customerName": account["name"],
+                "retainerActive": active,
+                "retainerBalanceSeconds": balance,
+                "retainerSessionId": retainer["session_id"] if active else "",
+            }
+        return result
+
+    def _reconcile_registered_customer(self) -> None:
+        local = self.store.local_customer_session()
+        available = self.is_admin() or self.confirmed_remote_admin_online()
+        self.store.set_local("customer_admin_online", "1" if available else "0")
+        if not local:
+            return
+        if not available:
+            last_seen = float(local.get("last_admin_seen", 0))
+            if time.time() - last_seen > PEER_ONLINE_SECONDS:
+                self._force_local_customer_logout(
+                    "Admin connection was lost. Registered access was locked "
+                    "and returned to Guest mode."
+                )
+            return
+        try:
+            state = self._customer_admin_request("state", {
+                "customer_id": local["customer_id"],
+                "login_id": local["login_id"],
+            })
+        except PermissionError:
+            # The Admin has definitively invalidated this login. Do not give a
+            # reconnected stale PC another heartbeat window of registered access.
+            self._force_local_customer_logout(
+                "This registered login is no longer active. This PC was locked "
+                "and returned to Guest mode."
+            )
+            return
+        except Exception:
+            if time.time() - float(local.get("last_admin_seen", 0)) > \
+                    PEER_ONLINE_SECONDS:
+                self._force_local_customer_logout(
+                    "Registered login could not be verified. This PC was locked "
+                    "and returned to Guest mode."
+                )
+            return
+        updated = self._local_customer_from_state(
+            state, local.get("feedback", ""))
+        was_active = bool(local.get("retainer_active"))
+        self.store.save_local_customer_session(updated)
+        if was_active and not updated["retainer_active"]:
+            updated["feedback"] = (
+                "Retainer time exhausted. Ask staff to add time."
+                if updated["balance_seconds"] == 0 else
+                "Retainer play stopped; remaining time was saved."
+            )
+            self.store.save_local_customer_session(updated)
+            self.store.set_local("customer_feedback", updated["feedback"])
+            self._reconcile_local_access()
 
     def _tick_sessions(self) -> None:
         """Only this PC advances and finalizes its own session."""
@@ -1228,7 +2492,11 @@ class Runtime:
             return
         own_session = snap["sessions"].get(self.store.pc_id)
         current = sessions.phase(own_session, grace_minutes=snap["settings"]["grace_minutes"])
-        allowed = current in ("buffer", "timed", "open", "paused")
+        retainer_active = bool(
+            (self.store.local_customer_session() or {}).get("retainer_active")
+        )
+        allowed = (current in ("buffer", "timed", "open", "paused")
+                   or retainer_active or self.retainer_unlock_pending)
         if self.admin_ui_open:
             self.last_access_allowed = allowed
             return
@@ -1251,9 +2519,12 @@ class Runtime:
         if not snap or self.admin_ui_open:
             return False
         session = snap["sessions"].get(self.store.pc_id)
-        allowed = sessions.phase(
+        ordinary_allowed = sessions.phase(
             session, grace_minutes=snap["settings"]["grace_minutes"]
         ) in ("buffer", "timed", "open", "paused")
+        allowed = (ordinary_allowed or bool(
+            (self.store.local_customer_session() or {}).get("retainer_active"))
+            or self.retainer_unlock_pending)
         return self.last_access_allowed is allowed
 
     def _background_loop(self) -> None:
@@ -1269,6 +2540,8 @@ class Runtime:
                 self._settle_admin_ownership()
                 self._tick_sessions()
                 self.checkpoint_local_session()
+                self._checkpoint_active_retainers()
+                self._reconcile_registered_customer()
                 self._replicate_once()
                 self._reconcile_local_access()
             except Exception as error:

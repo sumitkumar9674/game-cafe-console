@@ -12,7 +12,7 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
-from PySide6.QtCore import QByteArray, QBuffer, QIODevice, QObject, QUrl
+from PySide6.QtCore import QByteArray, QBuffer, QIODevice, QMetaObject, QObject, QUrl
 from PySide6.QtGui import QIcon, QImage
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtWidgets import QApplication
@@ -20,8 +20,52 @@ from PySide6.QtWidgets import QApplication
 from game_cafe import sessions
 from game_cafe.branding import APP_ICON_PATH, APP_LOGO_PATH, app_logo_source, valid_image
 from game_cafe.qt_bridge import CafeBridge, RecordListModel
+from game_cafe.security import create_local_command_key, seal_local_password
 from game_cafe.qt_app import AvatarProvider
+from game_cafe.presentation import RetainerDisplayClock
 from game_cafe.storage import Store, new_pool
+
+
+class RetainerDisplayClockTest(unittest.TestCase):
+    @staticmethod
+    def state(seconds=100, sample=1000.0, session="session-1",
+              active=True):
+        return {
+            "customer_id": "customer-1", "retainer_session_id": session,
+            "retainer_active": active, "balance_seconds": seconds,
+            "retainer_display_seconds": seconds,
+            "retainer_display_at": sample,
+            "retainer_display_received_monotonic": 10.0,
+        }
+
+    def test_small_updates_keep_monotonic_countdown_and_never_add_time(self):
+        clock = RetainerDisplayClock()
+        self.assertEqual(clock.remaining(
+            self.state(), monotonic_now=10.0), 100)
+        self.assertEqual(clock.remaining(
+            self.state(103, 1001.0), monotonic_now=11.0), 99)
+        self.assertEqual(clock.remaining(
+            self.state(96, 1002.0), monotonic_now=12.0), 98)
+
+    def test_stale_sample_is_ignored_and_large_difference_reconciles(self):
+        clock = RetainerDisplayClock()
+        clock.remaining(self.state(), monotonic_now=10.0)
+        self.assertEqual(clock.remaining(
+            self.state(180, 999.0), monotonic_now=12.0), 98)
+        self.assertEqual(clock.remaining(
+            self.state(60, 1003.0), monotonic_now=13.0), 57)
+
+    def test_message_age_new_session_zero_and_final_value_are_hard_synced(self):
+        clock = RetainerDisplayClock()
+        self.assertEqual(clock.remaining(
+            self.state(100, 995.0), monotonic_now=15.0), 95)
+        self.assertEqual(clock.remaining(
+            self.state(50, 1001.0, "session-2"), monotonic_now=11.0), 49)
+        self.assertEqual(clock.remaining(
+            self.state(0, 1002.0, "session-2"), monotonic_now=12.0), 0)
+        self.assertEqual(clock.remaining(
+            self.state(43, 1003.0, "session-2", active=False),
+            monotonic_now=13.0), 43)
 
 
 class QtPresentationTest(unittest.TestCase):
@@ -37,6 +81,7 @@ class QtPresentationTest(unittest.TestCase):
         self.host.console_process = None
         self.runtime = Mock()
         self.runtime.events = queue.Queue()
+        self.runtime.is_admin.return_value = False
         self.runtime.confirmed_remote_admin_online.return_value = False
         self.bridge = CafeBridge(self.store, self.host, self.runtime)
 
@@ -64,6 +109,46 @@ class QtPresentationTest(unittest.TestCase):
         changed.assert_called_once()
         reset.assert_not_called()
         self.assertEqual(model.data(model.index(0, 0), model.RowRole)["name"], "New")
+
+    def test_overflow_text_marquee_runs_only_when_needed(self):
+        engine = QQmlApplicationEngine()
+        component = Path(__file__).resolve().parents[1] / "game_cafe" / "qml" / "OverflowText.qml"
+        engine.load(QUrl.fromLocalFile(str(component)))
+        self.assertEqual(len(engine.rootObjects()), 1)
+        item = engine.rootObjects()[0]
+        item.setProperty("width", 220)
+        item.setProperty("text", "Short label")
+        self.app.processEvents()
+        self.assertFalse(item.property("overflowing"))
+        self.assertFalse(item.property("marqueeRunning"))
+        item.setProperty("width", 45)
+        item.setProperty("text", "A deliberately long computer notification label")
+        self.app.processEvents()
+        self.app.processEvents()
+        self.assertTrue(item.property("overflowing"))
+        self.assertTrue(item.property("marqueeRunning"))
+
+    def test_dashboard_sidebar_lists_scroll_independently(self):
+        self.bridge._set_mode("admin")
+        engine = QQmlApplicationEngine()
+        engine.rootContext().setContextProperty("bridge", self.bridge)
+        qml = Path(__file__).resolve().parents[1] / "game_cafe" / "qml" / "App.qml"
+        engine.load(QUrl.fromLocalFile(str(qml)))
+        root = engine.rootObjects()[0]
+        root.setWidth(1366)
+        root.setHeight(768)
+        self.app.processEvents()
+        recent = root.findChild(QObject, "recentSessionsList")
+        notifications = root.findChild(QObject, "notificationList")
+        timestamp_timer = root.findChild(QObject, "notificationTimestampTimer")
+        self.assertIsNotNone(recent)
+        self.assertIsNotNone(notifications)
+        self.assertIsNotNone(timestamp_timer)
+        self.assertEqual(timestamp_timer.property("interval"), 60000)
+        self.assertIsNot(recent, notifications)
+        self.assertTrue(recent.property("clip"))
+        self.assertTrue(notifications.property("clip"))
+        self.assertGreater(recent.height(), notifications.height())
 
     def test_card_selection_and_expansion(self):
         self.bridge.pc_model.update_rows([
@@ -546,7 +631,34 @@ class QtPresentationTest(unittest.TestCase):
         self.runtime.start.assert_called_once()
         self.assertEqual(self.bridge.mode, "onboarding")
 
-    def test_saved_pool_without_live_admin_offers_claim_or_user(self):
+    def test_pairing_code_is_visible_before_request_finishes(self):
+        request = {"request_id": "a" * 32, "private": object(),
+                   "code": "004291", "cancel_token": "b" * 64,
+                   "payload": {"request_id": "a" * 32}}
+        self.runtime.prepare_join_request.return_value = request
+        self.runtime.finish_join.return_value = ("pending", None)
+        self.bridge._set_view(pools=[{
+            "poolId": "pool-1", "cafeName": "Cafe", "ip": "192.0.2.1"}])
+
+        self.bridge.startJoin("pool-1", "PC-02")
+
+        self.assertEqual(self.bridge.mode, "joining")
+        self.assertEqual(self.bridge.view["pairingCode"], "004291")
+        self.assertEqual(self.bridge.view["pairingState"],
+                         "Sending request to Admin")
+        self.wait_for_idle()
+        self.runtime.send_join_request.assert_called_once_with(
+            "192.0.2.1", request)
+
+    def test_pairing_qml_has_one_six_digit_verify_action(self):
+        qml = (Path(__file__).resolve().parents[1] /
+               "game_cafe" / "qml" / "Admin.qml").read_text(encoding="utf-8")
+        self.assertIn('placeholderText: "6-digit code"', qml)
+        self.assertIn('text: "Verify & Connect"', qml)
+        self.assertNotIn("bridge.preparePairing", qml)
+        self.assertNotIn('text: "Pair"', qml)
+
+    def test_designated_admin_node_offers_admin_or_user_when_not_logged_in(self):
         snapshot, secret = new_pool("Cafe", self.store.pc_id, "PC-01", "Admin",
                                     "long test password", self.store.node_public_key())
         self.store.save_pool(snapshot, secret, join=True)
@@ -554,23 +666,147 @@ class QtPresentationTest(unittest.TestCase):
         self.bridge.begin()
         self.wait_for_idle()
         self.assertEqual(self.bridge.mode, "candidate")
+        self.assertTrue(self.bridge.view["adminNode"])
+        self.assertFalse(self.bridge.view["adminOnline"])
         self.assertFalse(self.bridge.view["activeAdminDetected"])
         self.assertEqual(self.bridge.view["cafeName"], "Cafe")
 
-    def test_saved_pool_with_live_admin_stays_on_login_as_user_choice(self):
+    def test_user_pc_with_live_admin_stays_on_login_as_user_choice(self):
         snapshot, secret = new_pool("Cafe", self.store.pc_id, "PC-01", "Admin",
                                     "long test password", self.store.node_public_key())
+        admin_id = "a" * 32
+        snapshot["members"][admin_id] = {
+            "name": "Admin-PC", "public_key": "a" * 64}
+        snapshot["active_admin"]["pc_id"] = admin_id
         self.store.save_pool(snapshot, secret, join=True)
         self.runtime.verified_admin_online.return_value = True
         self.runtime.confirmed_remote_admin_online.return_value = True
         self.bridge.begin()
         self.wait_for_idle()
         self.assertEqual(self.bridge.mode, "candidate")
+        self.assertFalse(self.bridge.view["adminNode"])
+        self.assertTrue(self.bridge.view["adminOnline"])
+        self.assertEqual(self.bridge.view["adminPcName"], "Admin-PC")
         self.assertTrue(self.bridge.view["activeAdminDetected"])
         self.host.start_console.assert_not_called()
         self.host.stop_console.assert_not_called()
 
-    def test_login_selects_user_and_disables_admin_when_admin_appears(self):
+    def test_admin_signout_keeps_node_and_network_running(self):
+        snapshot, secret = new_pool("Cafe", self.store.pc_id, "PC-01", "Admin",
+                                    "long test password", self.store.node_public_key())
+        self.store.save_pool(snapshot, secret, join=True)
+        self.bridge._set_mode("admin")
+        self.runtime.is_admin.return_value = True
+        self.runtime.admin_ui_open = True
+        self.runtime.admin_signing_key = object()
+        self.bridge.signOutAdmin()
+        self.assertEqual(self.bridge.mode, "candidate")
+        self.assertFalse(self.runtime.admin_ui_open)
+        self.assertIsNone(self.runtime.admin_signing_key)
+        self.runtime.stop.assert_not_called()
+        self.runtime.release_admin.assert_not_called()
+        self.host.shutdown.assert_not_called()
+        self.host.start_console.assert_not_called()
+
+    def test_admin_node_user_console_keeps_authority_and_returns_to_login(self):
+        snapshot, secret = new_pool("Cafe", self.store.pc_id, "PC-01", "Admin",
+                                    "long test password", self.store.node_public_key())
+        self.store.save_pool(snapshot, secret, join=True)
+        self.runtime.is_admin.return_value = True
+        self.bridge._set_mode("candidate")
+        self.bridge.stayUser()
+        self.wait_for_idle()
+        self.assertEqual(self.bridge.mode, "widget")
+        self.host.start_console.assert_called_once()
+        self.assertTrue(self.runtime.is_admin())
+        self.bridge._return_to_login()
+        self.wait_for_idle()
+        self.assertEqual(self.bridge.mode, "candidate")
+        self.host.stop_console.assert_called_once()
+        self.runtime.release_admin.assert_not_called()
+
+    def test_admin_node_staff_route_verifies_password_before_login(self):
+        snapshot, secret = new_pool("Cafe", self.store.pc_id, "PC-01", "Admin",
+                                    "long test password", self.store.node_public_key())
+        self.store.save_pool(snapshot, secret, join=True)
+        private, public = create_local_command_key()
+        self.host.command_private_key = private
+        self.runtime.snapshot.return_value = self.store.snapshot()
+        self.bridge._set_mode("widget")
+        self.bridge._handle_local_command("return_to_login", {
+            "password_sealed": seal_local_password(public, "wrong password")})
+        self.wait_for_idle()
+        self.assertEqual(self.bridge.mode, "widget")
+        self.host.stop_console.assert_not_called()
+
+        self.bridge._handle_local_command("return_to_login", {
+            "password_sealed": seal_local_password(public, "long test password")})
+        self.wait_for_idle()
+        self.assertEqual(self.bridge.mode, "candidate")
+        self.host.stop_console.assert_called_once()
+        self.runtime.take_admin.assert_not_called()
+
+    def test_admin_sidebar_signout_requires_two_confirmations(self):
+        snapshot, secret = new_pool("Cafe", self.store.pc_id, "PC-01", "Admin",
+                                    "long test password", self.store.node_public_key())
+        self.store.save_pool(snapshot, secret, join=True)
+        self.bridge._set_mode("admin")
+        self.runtime.is_admin.return_value = True
+        self.runtime.admin_ui_open = True
+        self.runtime.admin_signing_key = object()
+        engine = QQmlApplicationEngine()
+        engine.rootContext().setContextProperty("bridge", self.bridge)
+        qml = Path(__file__).resolve().parents[1] / "game_cafe" / "qml" / "App.qml"
+        engine.load(QUrl.fromLocalFile(str(qml)))
+        root = engine.rootObjects()[0]
+        admin = root.findChild(QObject, "adminPage")
+        admin.setProperty("section", "Settings")
+        self.app.processEvents()
+        sign_out = root.findChild(QObject, "adminSignOutButton")
+        self.assertIsNotNone(sign_out)
+        self.assertTrue(sign_out.property("enabled"))
+        admin_source = qml.with_name("Admin.qml").read_text(encoding="utf-8")
+        self.assertIn("onClicked: root.confirmAdminSignOut()", admin_source)
+        QMetaObject.invokeMethod(root, "confirmAdminSignOut")
+        self.app.processEvents()
+        confirmation = root.property("confirmation")
+        self.assertEqual(confirmation.property("title").toString(),
+                         "Sign out of Admin?")
+        self.assertEqual(confirmation.property("label").toString(), "Continue")
+        self.assertEqual(confirmation.property("cancelLabel").toString(), "Cancel")
+        QMetaObject.invokeMethod(root, "cancelConfirmation")
+        self.app.processEvents()
+        self.assertEqual(root.property("confirmation").property("title").toString(),
+                         "undefined")
+        self.assertEqual(self.bridge.mode, "admin")
+
+        QMetaObject.invokeMethod(root, "confirmAdminSignOut")
+        QMetaObject.invokeMethod(root, "acceptConfirmation")
+        self.app.processEvents()
+        confirmation = root.property("confirmation")
+        self.assertEqual(confirmation.property("title").toString(),
+                         "Confirm Sign Out")
+        self.assertEqual(confirmation.property("label").toString(),
+                         "Confirm Sign Out")
+        self.assertEqual(confirmation.property("cancelLabel").toString(), "Go Back")
+        QMetaObject.invokeMethod(root, "cancelConfirmation")
+        self.app.processEvents()
+        self.assertEqual(root.property("confirmation").property("title").toString(),
+                         "Sign out of Admin?")
+        self.assertEqual(self.bridge.mode, "admin")
+        QMetaObject.invokeMethod(root, "acceptConfirmation")
+        QMetaObject.invokeMethod(root, "acceptConfirmation")
+        self.app.processEvents()
+        self.assertEqual(self.bridge.mode, "candidate")
+        self.assertFalse(self.runtime.admin_ui_open)
+        self.assertIsNone(self.runtime.admin_signing_key)
+        self.runtime.stop.assert_not_called()
+        self.runtime.release_admin.assert_not_called()
+        self.host.shutdown.assert_not_called()
+
+    def test_user_pc_admin_access_stays_disabled_online_or_offline(self):
+        self.bridge._set_view(adminNode=False, adminOnline=False,
+                              adminPcName="Admin-PC")
         self.bridge._set_mode("candidate")
         engine = QQmlApplicationEngine()
         engine.rootContext().setContextProperty("bridge", self.bridge)
@@ -581,10 +817,12 @@ class QtPresentationTest(unittest.TestCase):
         continue_button = root.findChild(QObject, "continueAsUserButton")
         heading = root.findChild(QObject, "loginRoleHeading")
         message = root.findChild(QObject, "activeAdminMessage")
-        self.assertTrue(admin_option.property("enabled"))
-        self.assertFalse(continue_button.property("visible"))
+        self.assertFalse(admin_option.property("enabled"))
+        self.assertTrue(continue_button.property("visible"))
+        self.assertEqual(heading.property("text"), "Continue as User")
+        self.assertIn("offline", message.property("text"))
 
-        self.bridge._set_view(activeAdminDetected=True)
+        self.bridge._set_view(adminOnline=True, activeAdminDetected=True)
         self.app.processEvents()
         self.assertFalse(admin_option.property("enabled"))
         self.assertTrue(continue_button.property("visible"))
@@ -592,16 +830,25 @@ class QtPresentationTest(unittest.TestCase):
         self.assertTrue(message.property("visible"))
         self.host.start_console.assert_not_called()
 
-        self.bridge._set_view(activeAdminDetected=False)
+        self.bridge._set_view(adminOnline=False, activeAdminDetected=False)
         self.app.processEvents()
-        self.assertTrue(admin_option.property("enabled"))
+        self.assertFalse(admin_option.property("enabled"))
         self.assertTrue(continue_button.property("visible"))
         self.assertEqual(heading.property("text"), "Continue as User")
+        self.assertIn("offline", message.property("text"))
+
+        self.bridge._set_view(adminNode=True, adminOnline=False)
+        self.app.processEvents()
+        self.assertTrue(admin_option.property("enabled"))
         self.host.start_console.assert_not_called()
 
     def test_login_admin_check_reuses_refresh_and_stops_outside_login(self):
         snapshot, secret = new_pool("Cafe", self.store.pc_id, "PC-01", "Admin",
                                     "long test password", self.store.node_public_key())
+        admin_id = "a" * 32
+        snapshot["members"][admin_id] = {
+            "name": "Admin-PC", "public_key": "a" * 64}
+        snapshot["active_admin"]["pc_id"] = admin_id
         self.store.save_pool(snapshot, secret, join=True)
         self.runtime.status.return_value = {"desktop": "Default"}
         self.runtime.is_admin.return_value = False
@@ -623,7 +870,8 @@ class QtPresentationTest(unittest.TestCase):
                                     "long test password", self.store.node_public_key())
         self.store.save_pool(snapshot, secret, join=True)
         self.bridge.refresh_timer.stop()
-        self.bridge._set_view(activeAdminDetected=True)
+        self.bridge._set_view(adminNode=False, adminOnline=True,
+                              adminPcName="Admin-PC", activeAdminDetected=True)
         self.bridge._set_mode("candidate")
         engine = QQmlApplicationEngine()
         engine.rootContext().setContextProperty("bridge", self.bridge)

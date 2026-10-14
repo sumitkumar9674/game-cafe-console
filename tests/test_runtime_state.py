@@ -4,6 +4,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import copy
 import json
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -77,6 +78,147 @@ class RuntimeStateTest(unittest.TestCase):
         self.admin_store.apply_snapshot(old)
         self.assertNotIn(pc_id, self.admin_store.snapshot()["sessions"])
 
+    def test_two_complete_sessions_can_run_back_to_back(self):
+        pc_id = self.user_store.pc_id
+        session_ids = []
+        for _ in range(2):
+            self.admin.admin_action(
+                "start", pc_id, kind="timed", paid_minutes=15,
+                buffer_minutes=0)
+            session_ids.append(
+                self.user_store.snapshot()["sessions"][pc_id]["id"])
+            self.admin.admin_action("end", pc_id, reason="admin")
+        self.assertEqual(len(set(session_ids)), 2)
+        self.assertNotIn(pc_id, self.user_store.snapshot()["sessions"])
+        self.assertEqual(
+            [item["id"] for item in
+             self.user_store.snapshot()["history"][pc_id]], session_ids)
+
+    def test_active_session_replacement_finishes_before_new_start(self):
+        pc_id = self.user_store.pc_id
+        self.admin.admin_action(
+            "start", pc_id, kind="open", paid_minutes=0,
+            buffer_minutes=0)
+        previous = self.user_store.snapshot()["sessions"][pc_id]["id"]
+        self.admin.replace_session(
+            pc_id, kind="timed", paid_minutes=30, buffer_minutes=5)
+        snapshot = self.user_store.snapshot()
+        self.assertEqual(snapshot["history"][pc_id][-1]["id"], previous)
+        self.assertEqual(snapshot["history"][pc_id][-1]["reason"], "admin")
+        self.assertNotEqual(snapshot["sessions"][pc_id]["id"], previous)
+
+    def test_wall_clock_skew_does_not_expire_received_admin_authority(self):
+        pc_id = self.user_store.pc_id
+        incoming = copy.deepcopy(self.admin_store.snapshot())
+        incoming["active_admin"]["expires_at"] = 1
+        self.user.handle_member(
+            "push_snapshot", {"snapshot": incoming},
+            self.admin_store.pc_id, "admin")
+        with patch("game_cafe.runtime.time.time", return_value=10**12):
+            self.admin.peer_statuses[pc_id] = (
+                10**12, {"pc_id": pc_id, "authority_protocol": 2})
+            self.admin.admin_action(
+                "start", pc_id, kind="open", paid_minutes=0,
+                buffer_minutes=0)
+        self.assertIn(pc_id, self.user_store.snapshot()["sessions"])
+
+    def test_incompatible_authority_protocol_is_explicitly_rejected(self):
+        incoming = copy.deepcopy(self.admin_store.snapshot())
+        incoming["authority_protocol"] = 1
+        with self.assertRaisesRegex(RuntimeError, "Incompatible"):
+            self.user.handle_member(
+                "push_snapshot", {"snapshot": incoming},
+                self.admin_store.pc_id, "admin")
+
+    def test_admin_local_lease_survives_wall_clock_adjustment(self):
+        with patch("game_cafe.runtime.time.time", return_value=10**12):
+            self.assertTrue(self.admin.is_admin())
+        with patch("game_cafe.runtime.time.time", return_value=1):
+            self.assertTrue(self.admin.is_admin())
+
+    def test_lost_start_and_end_acknowledgments_reconcile_once(self):
+        pc_id = self.user_store.pc_id
+        original_call = self.admin.network.call
+        lost_actions = {"start", "end"}
+
+        def lose_once(ip, operation, data):
+            reply = original_call(ip, operation, data)
+            if operation == "session_command":
+                action = data["command"]["action"]
+                if action in lost_actions:
+                    lost_actions.remove(action)
+                    raise OSError(f"lost {action} acknowledgment")
+            return reply
+
+        with patch.object(self.admin.network, "call", side_effect=lose_once):
+            self.admin.admin_action(
+                "start", pc_id, kind="timed", paid_minutes=10,
+                buffer_minutes=0)
+            session_id = self.user_store.snapshot()["sessions"][pc_id]["id"]
+            self.admin.admin_action("end", pc_id, reason="admin")
+        snapshot = self.user_store.snapshot()
+        self.assertNotIn(pc_id, snapshot["sessions"])
+        self.assertEqual(
+            [item["id"] for item in snapshot["history"][pc_id]],
+            [session_id])
+        actions = [item["action"] for item in
+                   self.admin_store.session_command_audit()]
+        self.assertEqual(actions.count("start"), 1)
+        self.assertEqual(actions.count("end"), 1)
+
+    def test_snapshot_failure_does_not_create_pending_command(self):
+        pc_id = self.user_store.pc_id
+        original_call = self.admin.network.call
+
+        def reject_snapshot(ip, operation, data):
+            if operation == "push_snapshot":
+                raise RuntimeError("simulated snapshot rejection")
+            return original_call(ip, operation, data)
+
+        with patch.object(self.admin.network, "call",
+                          side_effect=reject_snapshot):
+            with self.assertRaisesRegex(RuntimeError, "snapshot rejection"):
+                self.admin.admin_action(
+                    "start", pc_id, kind="open", paid_minutes=0,
+                    buffer_minutes=0)
+        pending = (f"pending_session_command:"
+                   f"{self.admin_store.current_pool_id}:{pc_id}")
+        self.assertIsNone(self.admin_store.local(pending))
+
+    def test_pending_applied_command_reconciles_after_admin_restart(self):
+        pc_id = self.user_store.pc_id
+        original_call = self.admin.network.call
+
+        def lose_delivery_result(ip, operation, data):
+            if operation == "session_command":
+                original_call(ip, operation, data)
+                raise OSError("mutation reply lost")
+            if operation == "command_status":
+                raise OSError("status temporarily unavailable")
+            return original_call(ip, operation, data)
+
+        with patch.object(self.admin.network, "call",
+                          side_effect=lose_delivery_result):
+            with self.assertRaisesRegex(RuntimeError, "uncertain"):
+                self.admin.admin_action(
+                    "start", pc_id, kind="open", paid_minutes=0,
+                    buffer_minutes=0)
+        key = (f"pending_session_command:"
+               f"{self.admin_store.current_pool_id}:{pc_id}")
+        self.assertIsNotNone(self.admin_store.local(key))
+
+        restarted = Runtime(self.admin_store)
+        restarted.network.call = MagicMock(
+            side_effect=lambda ip, op, data: self.user.handle_member(
+                op, data, self.admin_store.pc_id, "admin"))
+        with patch.object(restarted, "_reconcile_local_access"):
+            restarted._resume_designated_admin()
+            restarted._poll_peer_statuses()
+            restarted._reconcile_pending_commands()
+        self.assertIsNone(self.admin_store.local(key))
+        self.assertEqual(
+            self.admin_store.session_command_audit()[-1]["state"], "applied")
+
     def test_owner_fifo_clear_and_stale_replica_cannot_resurrect(self):
         owner = self.user_store.pc_id
         records = []
@@ -131,7 +273,7 @@ class RuntimeStateTest(unittest.TestCase):
         self.assertEqual([r["id"] for r in self.admin_store.snapshot()["history"][owner]],
                          [new_session_id])
 
-    def test_history_clear_timeout_retries_same_command_without_second_deletion(self):
+    def test_history_clear_lost_reply_is_reconciled_without_duplicate_deletion(self):
         owner = self.user_store.pc_id
         self.admin.admin_action("start", owner, kind="open",
                                 paid_minutes=0, buffer_minutes=0)
@@ -146,18 +288,19 @@ class RuntimeStateTest(unittest.TestCase):
             return reply
 
         with patch.object(self.admin.network, "call", side_effect=lose_reply):
-            with self.assertRaises(OSError):
-                self.admin.clear_history(owner)
+            self.admin.clear_history(owner)
         self.assertEqual(self.user_store.snapshot()["history"][owner], [])
         first_epoch = next(item["payload"]["history_epoch"]
                            for item in self.user_store.owner_records()
                            if item["payload"]["pc_id"] == owner)
-        self.admin.clear_history(owner)
-        second_epoch = next(item["payload"]["history_epoch"]
-                            for item in self.user_store.owner_records()
-                            if item["payload"]["pc_id"] == owner)
-        self.assertEqual(first_epoch, second_epoch)
+        self.assertEqual(first_epoch, 1)
         self.assertEqual(self.admin_store.snapshot()["history"][owner], [])
+        audit = self.admin_store.session_command_audit()
+        self.assertEqual(audit[-1]["state"], "applied")
+        self.assertEqual(audit[-1]["action"], "clear_history")
+        pending_key = (
+            f"pending_session_command:{self.admin_store.current_pool_id}:{owner}")
+        self.assertIsNone(self.admin_store.local(pending_key))
 
     def test_clear_keeps_active_session_and_checkpoint(self):
         owner = self.user_store.pc_id

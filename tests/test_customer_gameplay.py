@@ -96,6 +96,7 @@ class CustomerGameplayTest(unittest.TestCase):
         with patch.object(self.admin.network, "call",
                           side_effect=OSError("offline")):
             self.admin._poll_peer_statuses()
+            self.admin._poll_peer_statuses()
 
     def test_login_is_authoritative_single_pc_and_logout_returns_guest(self):
         self.assertIsNone(self.user_store.local_customer_session())
@@ -457,16 +458,21 @@ class CustomerGameplayTest(unittest.TestCase):
 
     def test_registered_login_and_retainer_require_live_admin(self):
         self.user.peer_statuses.clear()
-        with self.assertRaisesRegex(RuntimeError, "Admin is offline"):
-            self.login()
+        with patch.object(self.user.network, "call",
+                          side_effect=OSError("offline")):
+            with self.assertRaisesRegex(RuntimeError, "Admin is offline"):
+                self.login()
         self.user.peer_statuses[self.admin_store.pc_id] = (
             time.time(), {"pc_id": self.admin_store.pc_id, "admin": True,
                           "admin_term": self.admin.snapshot()[
-                              "active_admin"]["term"]})
+                              "active_admin"]["term"],
+                          "authority_protocol": 2})
         self.login()
         self.user.peer_statuses.clear()
-        with self.assertRaisesRegex(RuntimeError, "Admin is offline"):
-            self.start_retainer()
+        with patch.object(self.user.network, "call",
+                          side_effect=OSError("offline")):
+            with self.assertRaisesRegex(RuntimeError, "Admin is offline"):
+                self.start_retainer()
 
     def test_admin_signout_does_not_interrupt_but_shutdown_does(self):
         self.login()

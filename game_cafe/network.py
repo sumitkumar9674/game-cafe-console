@@ -11,6 +11,8 @@ import threading
 import time
 import uuid
 
+from .diagnostics import (fingerprint, warning as diagnostic_warning)
+
 from .storage import Store
 from .lifecycle import lifecycle_event
 from .security import (sign_node, verify_node,
@@ -383,6 +385,11 @@ class NodeNetwork:
                             "error": "Pairing authorization was revoked.",
                             "revocation": notice,
                         })
+                        diagnostic_warning(
+                            "PAIRING", "STALE_CREDENTIAL_REJECTED",
+                            pc=fingerprint(request.get("sender")),
+                            operation=operation,
+                        )
                         return
                     raise
                 self.store.note_peer(request["sender"], ip)
@@ -392,6 +399,13 @@ class NodeNetwork:
                     )
                     body = {"for": request["nonce"], "ok": True, "result": result}
                 except Exception as error:
+                    if operation not in ("status", "session_records"):
+                        diagnostic_warning(
+                            "NETWORK", "REQUEST_REJECTED",
+                            pc=fingerprint(request.get("sender")),
+                            operation=operation,
+                            error_type=type(error).__name__, reason=str(error),
+                        )
                     body = {"for": request["nonce"], "ok": False,
                             "error": str(error)}
                 response = signed(secret, self.store.pc_id, snapshot["pool_id"],
@@ -409,6 +423,14 @@ class NodeNetwork:
                     self.runtime.receive_pairing_revocation(
                         request.get("data", {}).get("revocation"))
             except Exception as error:
+                failed_request = (request if "request" in locals()
+                                  and isinstance(request, dict) else {})
+                diagnostic_warning(
+                    "NETWORK", "AUTHENTICATION_REJECTED",
+                    pc=fingerprint(failed_request.get("sender")),
+                    operation=(operation if "operation" in locals() else "unknown"),
+                    error_type=type(error).__name__, reason=str(error),
+                )
                 try:
                     send_message(connection, {"ok": False, "error": str(error)})
                 except OSError:

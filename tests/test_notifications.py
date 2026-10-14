@@ -128,6 +128,7 @@ class NotificationLifecycleTest(unittest.TestCase):
     def test_pc_id_and_event_time_name_are_preserved_across_rename(self):
         self.poll_online()
         self.poll_offline()
+        self.poll_offline()
         snapshot = self.store.snapshot()
         snapshot["members"][USER_ID]["name"] = "Renamed PC"
         snapshot["revision"] += 1

@@ -11,7 +11,7 @@ python -m pip install -r requirements.txt
 python .\run_game_cafe.py
 ```
 
-Do not launch `--console-child` directly. The controller creates the child process on CafeConsole. To isolate test data, set `GAME_CAFE_DATA_DIR` to a dedicated directory before launch. Normal data stays in `%LOCALAPPDATA%\GameCafeConsole\console.sqlite3`; controller and child logs are written alongside it. The UI migration does not reset existing databases, identities, memberships, sessions, or history.
+Do not launch `--console-child` directly. The controller creates the child process on CafeConsole. To isolate test data, set `GAME_CAFE_DATA_DIR` to a dedicated directory before launch. Normal data stays in `%LOCALAPPDATA%\GameCafeConsole\console.sqlite3`. Diagnostics are plain-text files in `%LOCALAPPDATA%\GameCafeConsole\logs`: `gamegrid.log` for the controller and `console-child.log` for CafeConsole. Each file rotates at 5 MB and retains four archives, bounding both process logs to approximately 50 MB total. Send those files when reporting a failure; passwords, credentials, and long protocol identifiers are redacted. The UI migration does not reset existing databases, identities, memberships, sessions, or history.
 
 `cryptography` is required for authenticated encryption during pairing; the standard library has no equivalent primitive. `PySide6` supplies Qt Quick, QML, Controls, and native Windows rendering, which the standard library cannot provide.
 

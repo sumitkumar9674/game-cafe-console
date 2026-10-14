@@ -7,6 +7,12 @@ import sys
 from game_cafe.single_instance import WindowsSingleInstance
 from game_cafe.lifecycle import (disable_lifecycle_logging,
                                  enable_lifecycle_logging, lifecycle_event)
+from game_cafe.diagnostics import (close_diagnostics, configure_diagnostics,
+                                   info as diagnostic_info,
+                                   unexpected as diagnostic_unexpected)
+
+
+BUILD_IDENTIFIER = "1.1.2"
 
 
 def report(message: str) -> None:
@@ -32,13 +38,14 @@ def main() -> int:
                 report("Game Cafe Console is already running.")
                 return 0
         from game_cafe.storage import Store, default_data_path
-        log_name = "console-child.log" if child_mode else "controller.log"
-        log_file = open(default_data_path().parent / log_name,
-                        "a", encoding="utf-8", buffering=1)
-        sys.stdout = log_file
-        sys.stderr = log_file
+        configure_diagnostics(default_data_path().parent, child_mode)
         enable_lifecycle_logging()
         logging_started = True
+        diagnostic_info(
+            "APPLICATION", "STARTUP", build=BUILD_IDENTIFIER,
+            role="console-child" if child_mode else "controller",
+            packaged=bool(getattr(sys, "frozen", False)),
+        )
         lifecycle_event("process_started",
                         mode="console_child" if child_mode else "controller")
         from game_cafe.ui import Application, ConsoleChildScreen
@@ -50,12 +57,14 @@ def main() -> int:
             Application().run()
         lifecycle_event("application_run_returned")
     except Exception as error:
+        diagnostic_unexpected("APPLICATION", "UNEXPECTED_PROCESS_ERROR", error)
         report(f"Game Cafe Console could not start: {error}")
         return 1
     finally:
         if logging_started:
             lifecycle_event("main_process_returning")
             disable_lifecycle_logging()
+            close_diagnostics()
         if instance:
             instance.close()
     return 0

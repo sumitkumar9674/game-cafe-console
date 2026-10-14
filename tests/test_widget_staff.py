@@ -723,6 +723,23 @@ class LocalStaffSessionTest(unittest.TestCase):
             self.runtime.local_staff_session_action(
                 "add", "incorrect password", "5" * 32, minutes=15)
 
+    def test_local_staff_guest_start_is_blocked_when_admin_is_reachable(self):
+        admin_id = self.admin_store.pc_id
+        self.user_store.note_peer(admin_id, "admin")
+        term = self.user_store.snapshot()["active_admin"]["term"]
+        status = {
+            "pc_id": admin_id, "admin": True, "admin_term": term,
+            "authority_protocol": 2,
+        }
+        with patch.object(self.runtime.network, "call", return_value=status):
+            with self.assertRaisesRegex(RuntimeError, "Admin is online"):
+                self.runtime.local_staff_session_action(
+                    "start", PASSWORD, "8" * 32, kind="open",
+                    paid_minutes=0, buffer_minutes=0)
+        self.assertNotIn(
+            self.user_store.pc_id,
+            self.user_store.snapshot()["sessions"])
+
 
 if __name__ == "__main__":
     unittest.main()

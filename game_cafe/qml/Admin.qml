@@ -194,7 +194,7 @@ Item {
                                         Text { text: "PLAYER  " + card.rowData.player + "    ·    " + card.rowData.phase; color: "#F4F7FB"; font.pixelSize: 12 }
                                         Text { text: "Started " + card.rowData.startedText; color: "#A8B8CA"; visible: card.rowData.startedText !== ""; font.pixelSize: 12 }
                                         RowLayout {
-                                            visible: card.rowData.start
+                                            visible: card.rowData.start || card.rowData.replace
                                             Text { text: "Initial player: " + (card.rowData.registeredCustomerName || "Guest"); color: "#A8B8CA"; font.pixelSize: 12 }
                                         }
                                         RowLayout {
@@ -204,14 +204,23 @@ Item {
                                             DarkComboBox { id: paidField; model: ["15", "30", "60", "120", "Custom Minutes"]; currentIndex: 2; visible: kindBox.currentIndex === 0; Layout.preferredWidth: 145 }
                                             TextField { id: customPaid; visible: kindBox.currentIndex === 0 && paidField.currentIndex === 4; placeholderText: "Minutes"; Layout.preferredWidth: 88; inputMethodHints: Qt.ImhDigitsOnly }
                                             TextField { id: bufferField; text: "0"; placeholderText: "Buffer"; Layout.preferredWidth: 82; inputMethodHints: Qt.ImhDigitsOnly }
-                                            ActionButton { text: "Start session"; onClicked: {
+                                            ActionButton { text: card.rowData.replace ? "Start new session" : "Start session"; onClicked: {
                                                 let kind = kindBox.currentIndex === 0 ? "timed" : "open"
                                                 let paid = paidField.currentIndex === 4 ? customPaid.text : paidField.currentText
                                                 if ((kind === "timed" && !page.validMinutes(paid, false)) || !page.validMinutes(bufferField.text, true)) {
                                                     root.ask("Invalid session time", "Use whole minutes: paid time 1 to 1440 and buffer 0 to 1440.", "OK", function(){})
                                                     return
                                                 }
-                                                bridge.startSession(card.rowData.pcId, kind, paid, bufferField.text)
+                                                var startAction = function() {
+                                                    bridge.startSession(card.rowData.pcId, kind, paid, bufferField.text)
+                                                }
+                                                if (card.rowData.replace) {
+                                                    root.ask("End current session and start a new one?",
+                                                             "GameGrid will save " + card.rowData.player + "'s current session before starting the new session. No sessions will overlap.",
+                                                             "End & Start New", startAction)
+                                                } else {
+                                                    startAction()
+                                                }
                                             } }
                                         }
                                         RowLayout {
@@ -719,6 +728,24 @@ Item {
                                     "Remove " + rowData.name + " (ID: " + rowData.pcId + ") from this cafe? This revokes its current pairing. It must complete Admin-approved pairing again before reconnecting.",
                                     "Remove Computer",
                                     function() { bridge.removeComputer(rowData.pcId) })
+                            }
+                            ActionButton {
+                                objectName: "forceRemoveComputerButton"
+                                text: "Force Remove"
+                                danger: true
+                                visible: rowData.canForceRemove
+                                onClicked: {
+                                    var warning = "Force remove offline " + rowData.name
+                                        + " (ID: " + rowData.pcFingerprint + ")? The PC cannot be locked or confirmed ended. Its pairing will be revoked and it must pair again."
+                                    if (rowData.hasSavedSession)
+                                        warning += " Saved state contains an unresolved active session."
+                                    if (rowData.hasPendingCommand)
+                                        warning += " An unresolved Admin command will be archived for audit."
+                                    root.ask("Force Remove Offline Computer?", warning,
+                                             "Force Remove", function() {
+                                                 bridge.forceRemoveComputer(rowData.pcId)
+                                             })
+                                }
                             }
                         }
                     }

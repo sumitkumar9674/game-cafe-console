@@ -12,8 +12,7 @@ $internal = Join-Path $root 'dist\GameCafeConsole\_internal'
 $logo = Join-Path $root 'game_cafe\assets\branding\app_logo.png'
 $reference = Join-Path $root 'installer\assets\gamegrid_logo_reference.png'
 $ico = Join-Path $root 'installer\assets\gamegrid.ico'
-$outFile = Join-Path $root 'release\GameGrid-Setup-1.1.1.exe'
-
+$outFile = Join-Path $root 'release\GameGrid-Setup-1.1.2.exe'
 try {
     foreach ($file in @($buildScript, $installerSpec, $logo, $reference, $ico)) {
         if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {

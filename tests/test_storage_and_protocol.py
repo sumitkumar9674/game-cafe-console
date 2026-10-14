@@ -99,6 +99,10 @@ class StorageAndProtocolTest(unittest.TestCase):
                 self.assertEqual(store.db.execute(
                     "SELECT proposed_name FROM pending_joins WHERE request_id='old'"
                 ).fetchone()[0], "Old PC")
+                tables = {row[0] for row in store.db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'")}
+                self.assertTrue({"session_command_audit",
+                                 "removed_computer_audit"} <= tables)
             finally:
                 store.close()
 

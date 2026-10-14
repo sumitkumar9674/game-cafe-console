@@ -27,11 +27,13 @@ PASSWORD_ITERATIONS = 600_000
 HISTORY_PER_PC = 100
 NOTIFICATION_LIMIT = 100
 MAX_WALLPAPER_BYTES = 500_000
+AUTHORITY_PROTOCOL = 2
 
 
 def ensure_membership_fields(snapshot: dict) -> None:
     """Add deterministic authorization generations to legacy snapshots."""
     pool_id = str(snapshot.get("pool_id", ""))
+    snapshot.setdefault("authority_protocol", AUTHORITY_PROTOCOL)
     snapshot.setdefault("revocations", {})
     for pc_id, member in snapshot.get("members", {}).items():
         member.setdefault("authorization_id", legacy_authorization_id(
@@ -92,6 +94,7 @@ def new_pool(cafe_name: str, pc_id: str, pc_name: str,
     signing = create_admin_signing_record(password)
     snapshot = {
         "pool_id": pool_id, "revision": 1,
+        "authority_protocol": AUTHORITY_PROTOCOL,
         "cafe_name": cafe_name.strip(),
         "logo": None,
         "developer_website": "",
@@ -272,6 +275,25 @@ class Store:
                 created_at INTEGER NOT NULL,
                 acknowledged INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS session_command_audit (
+                pool_id TEXT NOT NULL,
+                command_id TEXT NOT NULL,
+                target_pc_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                state TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (pool_id, command_id)
+            );
+            CREATE TABLE IF NOT EXISTS removed_computer_audit (
+                pool_id TEXT NOT NULL,
+                pc_id TEXT NOT NULL,
+                removed_at REAL NOT NULL,
+                forced INTEGER NOT NULL,
+                evidence TEXT NOT NULL,
+                PRIMARY KEY (pool_id, pc_id, removed_at)
+            );
         """)
         self.db.execute(
             "CREATE INDEX IF NOT EXISTS customer_accounts_name "
@@ -402,6 +424,14 @@ class Store:
             row = self.db.execute("SELECT value FROM local WHERE key=?", (key,)).fetchone()
             return row[0] if row else None
 
+    def local_items(self, prefix: str) -> list[tuple[str, str]]:
+        """Return local values under one explicit namespace."""
+        with self._lock:
+            return self.db.execute(
+                "SELECT key,value FROM local WHERE key LIKE ? ORDER BY key",
+                (prefix + "%",),
+            ).fetchall()
+
     def set_local(self, key: str, value: str) -> None:
         with self._lock, self.db:
             self.db.execute(
@@ -412,6 +442,128 @@ class Store:
     def delete_local(self, key: str) -> None:
         with self._lock, self.db:
             self.db.execute("DELETE FROM local WHERE key=?", (key,))
+
+    def archive_session_command(self, signed_command: dict, state: str,
+                                reason: str) -> None:
+        """Retain bounded command evidence when a pending operation is resolved."""
+        command = signed_command.get("command", {})
+        pool_id = str(command.get("pool_id") or self.current_pool_id or "")
+        command_id = str(command.get("id", ""))
+        if not pool_id or not command_id:
+            return
+        safe_reason = str(reason)[:240]
+        with self._lock, self.db:
+            self.db.execute(
+                "INSERT INTO session_command_audit VALUES(?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(pool_id,command_id) DO UPDATE SET "
+                "state=excluded.state,reason=excluded.reason,"
+                "updated_at=excluded.updated_at",
+                (pool_id, command_id, str(command.get("target", "")),
+                 str(command.get("action", "")), state,
+                 json.dumps(signed_command, separators=(",", ":")),
+                 safe_reason, time.time()),
+            )
+
+    def session_command_audit(self) -> list[dict]:
+        pool_id = self.current_pool_id
+        if not pool_id:
+            return []
+        with self._lock:
+            rows = self.db.execute(
+                "SELECT command_id,target_pc_id,action,state,reason,updated_at "
+                "FROM session_command_audit WHERE pool_id=? ORDER BY updated_at",
+                (pool_id,),
+            ).fetchall()
+        names = ("command_id", "target_pc_id", "action", "state", "reason",
+                 "updated_at")
+        return [dict(zip(names, row)) for row in rows]
+
+    def commit_forced_removal(self, pc_id: str, authorization_id: str,
+                              revocation: dict, evidence: dict,
+                              pending_command: dict | None) -> dict:
+        """Atomically revoke an offline PC and archive every unresolved record."""
+        pool_id = self.current_pool_id
+        if not pool_id:
+            raise RuntimeError("This PC has not joined a cafe.")
+        now = time.time()
+        pending_key = f"pending_session_command:{pool_id}:{pc_id}"
+        with self._lock, self.db:
+            current = self.snapshot()
+            member = current.get("members", {}).get(pc_id) if current else None
+            if not member or member.get("authorization_id") != authorization_id:
+                raise RuntimeError(
+                    "The PC pairing changed during removal. Refresh and retry.")
+            result = copy.deepcopy(current)
+            result["members"].pop(pc_id, None)
+            result["sessions"].pop(pc_id, None)
+            result["unlock_requests"].pop(pc_id, None)
+            result.setdefault("revocations", {})[pc_id] = revocation
+            result["revision"] += 1
+            self.prune_history(result)
+            self.db.execute(
+                "UPDATE pools SET revision=?,snapshot=? WHERE pool_id=?",
+                (result["revision"], json.dumps(
+                    result, separators=(",", ":")), pool_id),
+            )
+            self.db.execute(
+                "INSERT INTO removed_computer_audit VALUES(?,?,?,?,?)",
+                (pool_id, pc_id, now, 1,
+                 json.dumps(evidence, separators=(",", ":"))),
+            )
+            self.db.execute(
+                "DELETE FROM owner_records WHERE pool_id=? AND pc_id=?",
+                (pool_id, pc_id),
+            )
+            if pending_command:
+                command = pending_command.get("command", {})
+                command_id = str(command.get("id", ""))
+                if command_id:
+                    self.db.execute(
+                        "INSERT INTO session_command_audit VALUES(?,?,?,?,?,?,?,?) "
+                        "ON CONFLICT(pool_id,command_id) DO UPDATE SET "
+                        "state=excluded.state,reason=excluded.reason,"
+                        "updated_at=excluded.updated_at",
+                        (pool_id, command_id, str(command.get("target", "")),
+                         str(command.get("action", "")),
+                         "archived_force_remove", json.dumps(
+                             pending_command, separators=(",", ":")),
+                         "target was unreachable during authorized force removal",
+                         now),
+                    )
+                self.db.execute("DELETE FROM local WHERE key=?", (pending_key,))
+            ownerships = self.db.execute(
+                "SELECT customer_id,login_id FROM customer_ownership "
+                "WHERE pool_id=? AND pc_id=?", (pool_id, pc_id)).fetchall()
+            for customer_id, login_id in ownerships:
+                self.db.execute(
+                    "UPDATE retainer_sessions SET state='stopped',ended_at=?,"
+                    "stop_reason='computer_force_removed' WHERE pool_id=? "
+                    "AND customer_id=? AND pc_id=? AND login_id=? "
+                    "AND state IN ('prepared','active')",
+                    (int(now), pool_id, customer_id, pc_id, login_id),
+                )
+            self.db.execute(
+                "DELETE FROM customer_ownership WHERE pool_id=? AND pc_id=?",
+                (pool_id, pc_id),
+            )
+            return result
+
+    def removed_computer_audit(self, pc_id: str | None = None) -> list[dict]:
+        pool_id = self.current_pool_id
+        if not pool_id:
+            return []
+        query = ("SELECT pc_id,removed_at,forced,evidence "
+                 "FROM removed_computer_audit WHERE pool_id=?")
+        values: tuple = (pool_id,)
+        if pc_id is not None:
+            query += " AND pc_id=?"
+            values = (pool_id, pc_id)
+        query += " ORDER BY removed_at"
+        with self._lock:
+            rows = self.db.execute(query, values).fetchall()
+        return [{"pc_id": row[0], "removed_at": row[1],
+                 "forced": bool(row[2]), "evidence": json.loads(row[3])}
+                for row in rows]
 
     def _local_customer_key(self) -> str:
         return f"customer_login:{self.current_pool_id or 'none'}"
@@ -1334,6 +1486,29 @@ class Store:
                 ("session_id", "customer_id", "pc_id", "login_id",
                  "operation_id", "state", "balance_seconds", "prepared_at",
                  "started_at", "checkpoint_at", "ended_at", "stop_reason")),
+            "pending_commands": [
+                {"key": key, "value": json.loads(value)}
+                for key, value in self.local_items(
+                    f"pending_session_command:{pool_id}:")
+            ],
+            "command_audit": [
+                {**dict(zip(
+                    ("command_id", "target_pc_id", "action", "state",
+                     "payload", "reason", "updated_at"), row)),
+                 "payload": json.loads(row[4])}
+                for row in self.db.execute(
+                    "SELECT command_id,target_pc_id,action,state,payload,reason,"
+                    "updated_at FROM session_command_audit WHERE pool_id=? "
+                    "ORDER BY command_id", (pool_id,)).fetchall()
+            ],
+            "removed_computers": [
+                {"pc_id": row[0], "removed_at": row[1],
+                 "forced": bool(row[2]), "evidence": json.loads(row[3])}
+                for row in self.db.execute(
+                    "SELECT pc_id,removed_at,forced,evidence "
+                    "FROM removed_computer_audit WHERE pool_id=? "
+                    "ORDER BY pc_id,removed_at", (pool_id,)).fetchall()
+            ],
         }
 
     def authoritative_handoff_bundle(self, source_admin: str, candidate: str,
@@ -1342,7 +1517,7 @@ class Store:
         with self._lock:
             state = self._authoritative_customer_state()
             bundle = {
-                "version": 1, "pool_id": self._customer_pool(),
+                "version": 2, "pool_id": self._customer_pool(),
                 "source_admin": source_admin, "candidate": candidate,
                 "term": int(term), "transfer_id": transfer_id,
                 "state": state, "state_digest": self._handoff_digest(state),
@@ -1355,7 +1530,7 @@ class Store:
             self, bundle: dict, source_admin: str, candidate: str,
             term: int, transfer_id: str) -> None:
         """Reject incomplete credentials, inconsistent records, and stale context."""
-        if (not isinstance(bundle, dict) or bundle.get("version") != 1
+        if (not isinstance(bundle, dict) or bundle.get("version") != 2
                 or bundle.get("pool_id") != self._customer_pool()
                 or bundle.get("source_admin") != source_admin
                 or bundle.get("candidate") != candidate
@@ -1364,7 +1539,8 @@ class Store:
             raise ValueError("Admin handoff context is invalid.")
         state = bundle.get("state")
         required = {"snapshot", "accounts", "adjustments", "tombstones",
-                    "operations", "ownership", "retainers"}
+                    "operations", "ownership", "retainers",
+                    "pending_commands", "command_audit", "removed_computers"}
         if (not isinstance(state, dict) or set(state) != required
                 or bundle.get("state_digest") != self._handoff_digest(state)):
             raise ValueError("Admin handoff state is incomplete or corrupt.")
@@ -1399,6 +1575,25 @@ class Store:
         if state["ownership"]:
             raise RuntimeError(
                 "Registered customer ownership must end before Admin transfer.")
+        pending_prefix = f"pending_session_command:{self._customer_pool()}:"
+        for item in state["pending_commands"]:
+            if (not isinstance(item, dict) or set(item) != {"key", "value"}
+                    or not str(item["key"]).startswith(pending_prefix)
+                    or not isinstance(item["value"], dict)
+                    or item["value"].get("command", {}).get("pool_id")
+                    != self._customer_pool()):
+                raise ValueError("Admin handoff pending command state is invalid.")
+        for item in state["command_audit"]:
+            if (not isinstance(item, dict)
+                    or not isinstance(item.get("payload"), dict)
+                    or item.get("payload", {}).get("command", {}).get("id")
+                    != item.get("command_id")):
+                raise ValueError("Admin handoff command audit is invalid.")
+        for item in state["removed_computers"]:
+            if (not isinstance(item, dict)
+                    or not isinstance(item.get("evidence"), dict)
+                    or not item.get("pc_id")):
+                raise ValueError("Admin handoff removal audit is invalid.")
 
         account_ids: set[str] = set()
         names: set[str] = set()
@@ -1541,7 +1736,8 @@ class Store:
             for table in ("customer_adjustments", "customer_operations",
                           "customer_ownership", "retainer_sessions",
                           "customer_accounts", "customer_tombstones",
-                          "customer_sync_acks", "customer_sync_state"):
+                          "customer_sync_acks", "customer_sync_state",
+                          "session_command_audit", "removed_computer_audit"):
                 self.db.execute(f"DELETE FROM {table} WHERE pool_id=?", (pool_id,))
             for item in state["accounts"]:
                 self.db.execute(
@@ -1581,6 +1777,27 @@ class Store:
                      float(item["prepared_at"]), item["started_at"],
                      item["checkpoint_at"], item["ended_at"],
                      item["stop_reason"]))
+            self.db.execute(
+                "DELETE FROM local WHERE key LIKE ?",
+                (f"pending_session_command:{pool_id}:%",))
+            for item in state["pending_commands"]:
+                self.db.execute(
+                    "INSERT INTO local(key,value) VALUES(?,?)",
+                    (item["key"], json.dumps(
+                        item["value"], separators=(",", ":"))))
+            for item in state["command_audit"]:
+                self.db.execute(
+                    "INSERT INTO session_command_audit VALUES(?,?,?,?,?,?,?,?)",
+                    (pool_id, item["command_id"], item["target_pc_id"],
+                     item["action"], item["state"], json.dumps(
+                         item["payload"], separators=(",", ":")),
+                     item["reason"], float(item["updated_at"])))
+            for item in state["removed_computers"]:
+                self.db.execute(
+                    "INSERT INTO removed_computer_audit VALUES(?,?,?,?,?)",
+                    (pool_id, item["pc_id"], float(item["removed_at"]),
+                     int(bool(item["forced"])), json.dumps(
+                         item["evidence"], separators=(",", ":"))))
             snapshot = copy.deepcopy(state["snapshot"])
             self.db.execute(
                 "UPDATE pools SET revision=?,snapshot=? WHERE pool_id=?",
@@ -2035,6 +2252,7 @@ class Store:
         """Save snapshot before changing membership; an old pool stays recoverable."""
         with self._lock, self.db:
             snapshot = copy.deepcopy(snapshot)
+            snapshot.setdefault("authority_protocol", AUTHORITY_PROTOCOL)
             settings = snapshot.setdefault("settings", {})
             settings.setdefault("retainer_restart_cooldown_minutes", 0)
             settings.setdefault("customer_login_cooldown_minutes", 0)

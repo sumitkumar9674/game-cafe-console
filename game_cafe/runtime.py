@@ -19,6 +19,9 @@ from cryptography.exceptions import InvalidSignature
 from . import sessions
 from .customers import retainer_seconds, validate_cooldown_minutes
 from .desktops import active_desktop_name, switch
+from .diagnostics import (fingerprint, info as diagnostic_info,
+                          unexpected as diagnostic_unexpected,
+                          warning as diagnostic_warning)
 from .lifecycle import lifecycle_event
 from .network import (NodeNetwork, authenticated_call, create_pairing_key,
                       discover, open_welcome, pairing_secret,
@@ -29,10 +32,12 @@ from .security import (create_admin_signing_record, sign_admin_proof,
                        seal_admin_handoff, sign_node, unlock_admin_signing_key,
                        verify_admin_proof, verify_node,
                        verify_pairing_revocation)
-from .storage import Store, hash_password, verify_password
+from .storage import (AUTHORITY_PROTOCOL, Store, hash_password,
+                      verify_password)
 
 
 LEASE_SECONDS = 15
+AUTHORITY_FRESH_SECONDS = 30
 PEER_ONLINE_SECONDS = 9
 SYNC_INTERVAL_SECONDS = 3
 RETAINER_CHECKPOINT_SECONDS = 10
@@ -78,11 +83,11 @@ class Runtime:
         self.lock = threading.RLock()
         self.peer_statuses: dict[str, tuple[float, dict]] = {}
         self.connection_states: dict[str, bool] = {}
+        self.peer_failures: dict[str, int] = {}
         self.graceful_disconnects: set[str] = set()
         self.admin_signing_key = None
         self.lease_challenges: dict[tuple[str, str], float] = {}
         self.handoff_transfer: dict | None = None
-        self.handoff_until = 0.0
         self.run_id = uuid.uuid4().hex
         self.last_checkpoint = 0.0
         self.local_shutdown_pending = False
@@ -90,6 +95,20 @@ class Runtime:
         self.customer_auth_failures: dict[tuple[str, str], tuple[int, float]] = {}
         self.retainer_unlock_pending = False
         self.pairing_removal: dict | None = None
+        self.handoff_deadline = 0.0
+        self.local_claim_deadline = 0.0
+        self.admin_claim_receipts: dict[tuple[str, int], float] = {}
+        self.pending_retry_state: dict[str, tuple[float, int]] = {}
+        self.customer_sync_errors: dict[str, str] = {}
+        snapshot = self.store.snapshot()
+        diagnostic_info(
+            "APPLICATION", "RUNTIME_INITIALIZED",
+            pc=fingerprint(self.store.pc_id),
+            pool=fingerprint(self.store.current_pool_id),
+            role=("designated-admin" if snapshot and
+                  snapshot["active_admin"].get("pc_id") == self.store.pc_id
+                  else "user"),
+        )
 
     def start(self) -> None:
         self.network.start()
@@ -112,6 +131,8 @@ class Runtime:
         self.worker.start()
 
     def stop(self) -> None:
+        diagnostic_info("APPLICATION", "RUNTIME_STOPPING",
+                        pc=fingerprint(self.store.pc_id))
         self.stop_event.set()
         lifecycle_event("network_listener_shutdown_started")
         self.network.stop()
@@ -122,11 +143,18 @@ class Runtime:
             self.worker.join()
             lifecycle_event("runtime_background_worker_join_completed")
             self.worker = None
+        diagnostic_info("APPLICATION", "RUNTIME_STOPPED",
+                        pc=fingerprint(self.store.pc_id))
 
     def release_admin(self) -> None:
+        was_admin = self.is_admin()
         if self.store.current_pool_id and self.is_admin():
             self.store.set_local(self._lease_key("until"), "0")
         self.admin_signing_key = None
+        self.local_claim_deadline = 0.0
+        if was_admin:
+            diagnostic_info("AUTHORITY", "LOCAL_AUTHORITY_RELEASED",
+                            pc=fingerprint(self.store.pc_id))
 
     def _owner_payload(self) -> tuple[dict | None, list[dict], list[dict]]:
         snap = self.snapshot()
@@ -169,6 +197,12 @@ class Runtime:
         if not any(item["id"] == record["id"] for item in history):
             history.append(record)
         self._save_owner_state(None, history, grants)
+        diagnostic_info(
+            "SESSION", "INTERRUPTED_SESSION_RECOVERED",
+            pc=fingerprint(self.store.pc_id),
+            session=fingerprint(record["id"]),
+            duration_seconds=record.get("counted_seconds", 0),
+            result="persisted")
         return True
 
     def _migrate_legacy_owner_session(self) -> None:
@@ -211,6 +245,12 @@ class Runtime:
             if not any(item["id"] == record["id"] for item in history):
                 history.append(record)
             self._save_owner_state(None, history, grants, now)
+            diagnostic_info(
+                "SESSION", "SESSION_COMPLETED",
+                pc=fingerprint(self.store.pc_id),
+                session=fingerprint(record["id"]), reason=reason,
+                duration_seconds=record.get("counted_seconds", 0),
+                result="persisted")
             if reconcile_access:
                 self._reconcile_local_access()
             return True
@@ -350,19 +390,55 @@ class Runtime:
 
             self.store.update(extend)
 
+    def _claim_key(self, pc_id: str, term: int) -> tuple[str, int]:
+        return str(pc_id), int(term)
+
+    def _note_admin_claim(self, pc_id: str, term: int) -> None:
+        """Start a recipient-local freshness window after authenticated receipt."""
+        key = self._claim_key(pc_id, term)
+        previous = self.admin_claim_receipts.get(key)
+        self.admin_claim_receipts = {key: time.monotonic()}
+        if previous is None or time.monotonic() - previous > AUTHORITY_FRESH_SECONDS:
+            diagnostic_info("AUTHORITY", "CLAIM_ACCEPTED",
+                            pc=fingerprint(self.store.pc_id),
+                            admin=fingerprint(pc_id), term=term,
+                            freshness_seconds=AUTHORITY_FRESH_SECONDS)
+
+    def _admin_claim_fresh(self, pc_id: str, term: int) -> bool:
+        received = self.admin_claim_receipts.get(self._claim_key(pc_id, term))
+        return bool(received is not None and
+                    time.monotonic() - received <= AUTHORITY_FRESH_SECONDS)
+
+    def _require_remote_admin(self, sender: str, term: int | None = None) -> dict:
+        """Validate authority using term plus this recipient's monotonic receipt."""
+        snap = self.snapshot()
+        claim = snap["active_admin"]
+        expected_term = int(claim.get("term", 0))
+        if (sender != claim.get("pc_id")
+                or (term is not None and int(term) != expected_term)
+                or not self._admin_claim_fresh(sender, expected_term)):
+            diagnostic_warning(
+                "AUTHORITY", "CLAIM_REJECTED", pc=fingerprint(self.store.pc_id),
+                admin=fingerprint(sender), expected_admin=fingerprint(
+                    claim.get("pc_id")), term=term, expected_term=expected_term,
+                reason="recipient-local authority freshness missing or expired",
+            )
+            raise PermissionError(
+                "Current Admin authority has not been refreshed on this PC.")
+        return claim
+
     def is_admin(self) -> bool:
         snap = self.snapshot()
         if not snap:
             return False
         lease = snap["active_admin"]
-        return (time.time() >= self.handoff_until
+        return (time.monotonic() >= self.handoff_deadline
                 and lease.get("pc_id") == self.store.pc_id
                 and int(lease.get("term", 0)) == int(
                     self.store.local(self._lease_key("term")) or 0)
-                and lease.get("expires_at", 0) > time.time()
+                and self.local_claim_deadline > time.monotonic()
                 and self.store.local(self._lease_key("pc")) == self.store.pc_id
-                and self.store.local(self._lease_key("run")) == self.run_id
-                and float(self.store.local(self._lease_key("until")) or 0) > time.time())
+                and self.store.local(self._lease_key("run")) == self.run_id)
 
     def active_admin_ip(self) -> str | None:
         snap = self.snapshot()
@@ -395,6 +471,11 @@ class Runtime:
             "access_ready": self._local_access_ready(),
             "admin": self.is_admin(),
             "admin_term": int(snap["active_admin"].get("term", 0)),
+            "authority_protocol": AUTHORITY_PROTOCOL,
+            "admin_control_ready": bool(
+                self.is_admin() or self._admin_claim_fresh(
+                    str(snap["active_admin"].get("pc_id", "")),
+                    int(snap["active_admin"].get("term", 0)))),
             "registered_customer_id": (customer or {}).get("customer_id", ""),
             "registered_customer_name": (customer or {}).get("name", ""),
             "retainer_active": bool((customer or {}).get("retainer_active")),
@@ -430,11 +511,12 @@ class Runtime:
         claim = snap["active_admin"]
         admin_id = claim.get("pc_id")
         if (not admin_id or admin_id == self.store.pc_id
-                or admin_id not in snap["members"]
-                or claim.get("expires_at", 0) <= time.time()):
+                or admin_id not in snap["members"]):
             return False
         status = self.peer_status(admin_id)
         return bool(status and status.get("admin")
+                    and int(status.get("authority_protocol", 0))
+                    == AUTHORITY_PROTOCOL
                     and status.get("pc_id") == admin_id
                     and int(status.get("admin_term", -1))
                     == int(claim.get("term", 0)))
@@ -455,7 +537,8 @@ class Runtime:
             try:
                 latest = self.network.call(peers[pc_id], "snapshot", {})["snapshot"]
                 if (latest["active_admin"].get("pc_id") == pc_id
-                        and latest["active_admin"].get("expires_at", 0) > time.time()):
+                        and int(latest.get("authority_protocol", 0))
+                        == AUTHORITY_PROTOCOL):
                     self.accept_admin_snapshot(latest, pc_id,
                                                follow_live_admin=True)
                     return pc_id, peers[pc_id]
@@ -467,6 +550,10 @@ class Runtime:
                               follow_live_admin: bool = False) -> bool:
         """Check a new owner's password-backed claim before saving its state."""
         current = self.snapshot()
+        if int(incoming.get("authority_protocol", 0)) != AUTHORITY_PROTOCOL:
+            raise RuntimeError(
+                "This computer uses an incompatible Admin authority protocol. "
+                "Update GameGrid on every cafe PC.")
         if (not current or incoming.get("pool_id") != current["pool_id"]
                 or sender not in current["members"]
                 or incoming.get("active_admin", {}).get("pc_id") != sender):
@@ -481,7 +568,7 @@ class Runtime:
         )
         if applied and not self.is_admin():
             if incoming["active_admin"].get("pc_id") != self.store.pc_id:
-                self.handoff_until = 0
+                self.handoff_deadline = 0
             self.admin_ui_open = False
             self.notify("role_lost")
         return applied
@@ -492,7 +579,11 @@ class Runtime:
             return
         admin_id = snap["active_admin"].get("pc_id")
         remote = self.peer_status(admin_id) if admin_id else None
-        connected = self.is_admin() or bool(remote and remote.get("admin"))
+        connected = self.is_admin() or bool(
+            remote and remote.get("admin")
+            and int(remote.get("authority_protocol", 0)) == AUTHORITY_PROTOCOL
+            and self._admin_claim_fresh(
+                str(admin_id), int(snap["active_admin"].get("term", 0))))
         note = ("Admin connected" if connected else
                 "Admin unavailable — current session continues locally; changes will sync."
                 if snap["sessions"].get(self.store.pc_id) else
@@ -566,7 +657,7 @@ class Runtime:
         self.admin_ui_open = False
         self.pairing_removal = None
         self.handoff_transfer = None
-        self.handoff_until = 0
+        self.handoff_deadline = 0
         self.last_access_allowed = None
         with self.lock:
             self.peer_statuses.clear()
@@ -822,6 +913,20 @@ class Runtime:
         if self.is_admin():
             return self._handle_customer_access(payload, self.store.pc_id)
         ip = self.active_admin_ip()
+        if ip and not self.confirmed_remote_admin_online():
+            try:
+                status = self.network.call(ip, "status", {})
+                snap = self.snapshot()
+                claim = snap["active_admin"] if snap else {}
+                if (status.get("pc_id") == claim.get("pc_id")
+                        and status.get("admin")
+                        and int(status.get("admin_term", -1))
+                        == int(claim.get("term", 0))
+                        and int(status.get("authority_protocol", 0))
+                        == AUTHORITY_PROTOCOL):
+                    self.peer_statuses[status["pc_id"]] = (time.time(), status)
+            except Exception:
+                pass
         if not ip or not self.confirmed_remote_admin_online():
             raise RuntimeError("Admin is offline. Registered access is unavailable.")
         return self.network.call(ip, "customer_access", payload)
@@ -1158,21 +1263,24 @@ class Runtime:
 
     def _hold_local_claim(self, term: int) -> None:
         """A local timeout stops a disconnected former Admin from writing."""
-        if time.time() < self.handoff_until:
+        if time.monotonic() < self.handoff_deadline:
             raise RuntimeError("This PC just handed off Admin control; wait and retry.")
         self.store.set_local(self._lease_key("pc"), self.store.pc_id)
         self.store.set_local(self._lease_key("run"), self.run_id)
         self.store.set_local(self._lease_key("term"), str(term))
         self.store.set_local(self._lease_key("until"),
                              str(time.time() + LEASE_SECONDS))
+        self.local_claim_deadline = time.monotonic() + LEASE_SECONDS
 
     def can_become_admin(self) -> bool:
         snap = self.snapshot()
         return bool(snap and not snap["sessions"].get(self.store.pc_id)
                     and not self.store.local_customer_session())
 
-    def take_admin(self, password: str) -> None:
+    def take_admin(self, password: str, progress=None) -> None:
         """Authenticate, then log in locally or use the existing live handoff."""
+        progress = progress or (lambda _stage: None)
+        progress("Authenticating Admin authority")
         self._require_pairing_available()
         live_admin = self._find_live_admin()
         snap = self.snapshot()
@@ -1182,15 +1290,22 @@ class Runtime:
             password, snap["admin_signing"]
         )
         if self._resume_pending_admin_handoff():
+            progress("Admin authority transfer completed")
             return
         if not self.can_become_admin():
             raise RuntimeError("End this PC's customer session before switching to Admin.")
         if live_admin:
-            self._take_from_active_admin(live_admin[1])
+            self._take_from_active_admin(live_admin[1], progress)
         else:
+            progress("Finalizing local Admin authority")
             self.login_admin_with_unlocked_key()
+            progress("Admin authority ready")
 
-    def _take_from_active_admin(self, ip: str) -> None:
+    def _take_from_active_admin(self, ip: str, progress=None) -> None:
+        progress = progress or (lambda _stage: None)
+        progress("Preparing Admin transfer")
+        diagnostic_info("HANDOFF", "TRANSFER_INITIATED",
+                        candidate=fingerprint(self.store.pc_id), ip=ip)
         latest = self.network.call(ip, "snapshot", {})["snapshot"]
         self.accept_admin_snapshot(latest, latest["active_admin"]["pc_id"])
         snap = self.snapshot()
@@ -1216,6 +1331,7 @@ class Runtime:
                 "signature": sign_admin_proof(self.admin_signing_key, proof),
             })
             prepared = True
+            progress("Transferring authoritative data")
             manifest = reply.get("manifest", {})
             ciphertext_bytes = int(manifest.get("ciphertext_bytes", 0))
             expected_chunks = (
@@ -1245,6 +1361,7 @@ class Runtime:
                 "sender_public": manifest.get("sender_public"),
                 "nonce": manifest.get("nonce"), "ciphertext": ciphertext,
             })
+            progress("Verifying and saving transferred data")
             saved_digest = self.store.apply_authoritative_handoff_bundle(
                 bundle, previous, self.store.pc_id, term, transfer_id)
             if saved_digest != manifest.get("state_digest"):
@@ -1256,6 +1373,7 @@ class Runtime:
             claim = {"pool_id": snap["pool_id"],
                      "candidate": self.store.pc_id, "term": term}
             try:
+                progress("Finalizing Admin authority")
                 commit = self.network.call(ip, "commit_admin_transfer", {
                     "transfer_id": transfer_id, "state_digest": saved_digest,
                     "claim": claim,
@@ -1269,8 +1387,16 @@ class Runtime:
             self._complete_committed_handoff(
                 committed_snapshot, previous, term, transfer_id)
             committed = True
+            progress("Admin authority transfer completed")
+            diagnostic_info("HANDOFF", "TRANSFER_COMPLETED",
+                            source=fingerprint(previous),
+                            candidate=fingerprint(self.store.pc_id), term=term,
+                            transfer=fingerprint(transfer_id))
         finally:
             if prepared and not committed:
+                diagnostic_warning("HANDOFF", "TRANSFER_INCOMPLETE",
+                                   candidate=fingerprint(self.store.pc_id),
+                                   transfer=fingerprint(transfer_id))
                 pending = self.store.local(self._pending_handoff_key())
                 if not pending:
                     try:
@@ -1391,7 +1517,7 @@ class Runtime:
             raise PermissionError("Admin password authorization is required.")
         if (self.store.local(self._lease_key("pc")) != self.store.pc_id
                 or int(self.store.local(self._lease_key("term")) or 0) != term
-                or float(self.store.local(self._lease_key("until")) or 0) <= time.time()):
+                or self.local_claim_deadline <= time.monotonic()):
             raise RuntimeError("Admin claim expired before activation; retry.")
 
         def claim(state):
@@ -1410,6 +1536,9 @@ class Runtime:
             member["last_connected_at"] = max(
                 float(member.get("last_connected_at", 0)), self.started_at)
         self.store.update(claim)
+        diagnostic_info("AUTHORITY", "CLAIM_CREATED",
+                        admin=fingerprint(self.store.pc_id), term=term,
+                        protocol=AUTHORITY_PROTOCOL)
         self.admin_ui_open = True
         self.notify("admin_ready")
         self._replicate_once()
@@ -1525,6 +1654,31 @@ class Runtime:
         self._reconcile_local_access()
         return updated
 
+    def replace_session(self, pc_id: str, **details) -> dict:
+        """Durably finish one ordinary session before starting its replacement."""
+        snap = self.snapshot()
+        current = snap["sessions"].get(pc_id)
+        if not current:
+            return self.admin_action("start", pc_id, **details)
+        customer = self.customer_pc_states().get(pc_id, {})
+        if customer.get("retainerActive"):
+            raise RuntimeError(
+                "Stop the registered customer's retainer session before replacement.")
+        diagnostic_info("SESSION", "REPLACEMENT_STARTED",
+                        pc=fingerprint(pc_id),
+                        session=fingerprint(current.get("id")))
+        self.admin_action("end", pc_id, reason="admin")
+        if self.snapshot()["sessions"].get(pc_id):
+            raise RuntimeError(
+                "The previous session could not be confirmed ended; no new "
+                "session was started.")
+        result = self.admin_action("start", pc_id, **details)
+        diagnostic_info("SESSION", "REPLACEMENT_COMPLETED",
+                        pc=fingerprint(pc_id),
+                        session=fingerprint(
+                            result["sessions"].get(pc_id, {}).get("id")))
+        return result
+
     def set_locked_wallpaper(self, content: bytes, media_type: str) -> dict:
         with self.lock:
             self._require_customer_admin()
@@ -1538,6 +1692,148 @@ class Runtime:
             self.store.reset_wallpaper()
         self.notify("changed")
 
+    def _prepare_peer_authority(self, pc_id: str) -> tuple[dict, dict]:
+        """Confirm identity/protocol, then refresh authority before any mutation."""
+        peer = next((item for item in self.store.peers()
+                     if item["pc_id"] == pc_id), None)
+        if not peer or self.peer_status(pc_id) is None:
+            raise RuntimeError(
+                "Target PC is offline; session control is unavailable.")
+        status = self.network.call(peer["ip"], "status", {})
+        if status.get("pc_id") != pc_id:
+            raise RuntimeError("Target PC identity did not match the selected computer.")
+        if int(status.get("authority_protocol", 0)) != AUTHORITY_PROTOCOL:
+            raise RuntimeError(
+                "Target PC uses an incompatible Admin authority protocol. "
+                "Update GameGrid on every cafe PC.")
+        snap = self.snapshot()
+        self.network.call(peer["ip"], "push_snapshot", {"snapshot": snap})
+        records = self.network.call(peer["ip"], "session_records", {}).get(
+            "records", [])
+        for record in records:
+            if record.get("payload", {}).get("pc_id") == pc_id:
+                self.store.merge_owner_record(record)
+        return peer, status
+
+    @staticmethod
+    def _command_applied(owner: dict | None, command_id: str) -> bool:
+        if not owner:
+            return False
+        return (any(item.get("command", {}).get("id") == command_id
+                    for item in owner.get("grants", [])) or
+                (owner.get("history_clear") or {}).get(
+                    "command", {}).get("id") == command_id)
+
+    def _query_command_result(self, peer: dict, signed_command: dict) -> dict:
+        command = signed_command["command"]
+        current_term = int(self.snapshot()["active_admin"]["term"])
+        reply = self.network.call(peer["ip"], "command_status", {
+            "command_id": command["id"], "term": current_term})
+        record = reply.get("record")
+        if record:
+            self.store.merge_owner_record(record)
+        return reply
+
+    def _resolve_pending_command(self, pc_id: str, peer: dict,
+                                 requested_action: str,
+                                 requested_details: dict) -> tuple[dict | None, bool]:
+        """Return a reusable command and whether the requested action is complete."""
+        snap = self.snapshot()
+        pending_key = f"pending_session_command:{snap['pool_id']}:{pc_id}"
+        raw = self.store.local(pending_key)
+        if not raw:
+            return None, False
+        signed_command = json.loads(raw)
+        previous = signed_command["command"]
+        same_action = (previous["action"] == requested_action and
+                       previous["details"] == requested_details)
+        diagnostic_info("SESSION", "RECONCILIATION_STARTED",
+                        pc=fingerprint(pc_id), op=fingerprint(previous["id"]),
+                        action=previous["action"])
+        reply = self._query_command_result(peer, signed_command)
+        if reply.get("applied"):
+            self.store.archive_session_command(
+                signed_command, "applied", "confirmed by target owner record")
+            self.store.delete_local(pending_key)
+            self.pending_retry_state.pop(pc_id, None)
+            diagnostic_info("SESSION", "RECONCILIATION_COMPLETED",
+                            pc=fingerprint(pc_id), op=fingerprint(previous["id"]),
+                            result="applied")
+            return None, same_action
+        if not reply.get("definitive"):
+            diagnostic_warning("SESSION", "RECONCILIATION_BLOCKED",
+                               pc=fingerprint(pc_id),
+                               op=fingerprint(previous["id"]),
+                               reason="target could not establish a durable result")
+            raise RuntimeError(
+                "The previous command result is still uncertain. GameGrid will "
+                "retry reconciliation after the connection recovers.")
+        current_claim = self.snapshot()["active_admin"]
+        reusable = (same_action
+                    and previous.get("admin_id") == self.store.pc_id
+                    and int(previous.get("term", -1))
+                    == int(current_claim.get("term", 0)))
+        if reusable:
+            diagnostic_info("SESSION", "COMMAND_RETRY_READY",
+                            pc=fingerprint(pc_id), op=fingerprint(previous["id"]),
+                            result="definitely_not_applied")
+            return signed_command, False
+        self.store.archive_session_command(
+            signed_command, "not_applied",
+            "target atomically confirmed absence; old authority command retired")
+        self.store.delete_local(pending_key)
+        self.pending_retry_state.pop(pc_id, None)
+        diagnostic_info("SESSION", "RECONCILIATION_COMPLETED",
+                        pc=fingerprint(pc_id), op=fingerprint(previous["id"]),
+                        result="not_applied")
+        return None, False
+
+    def _schedule_pending_retry(self, pc_id: str) -> None:
+        _next, attempts = self.pending_retry_state.get(pc_id, (0.0, 0))
+        attempts += 1
+        delay = min(60.0, float(3 * (2 ** min(attempts - 1, 4))))
+        self.pending_retry_state[pc_id] = (time.monotonic() + delay, attempts)
+
+    def _reconcile_pending_commands(self) -> None:
+        """Resolve durable uncertain commands after restart or reconnection."""
+        if not self.is_admin():
+            return
+        pool_id = self.store.current_pool_id or ""
+        prefix = f"pending_session_command:{pool_id}:"
+        for key, raw in self.store.local_items(prefix):
+            pc_id = key[len(prefix):]
+            due, _attempts = self.pending_retry_state.get(pc_id, (0.0, 0))
+            if time.monotonic() < due or self.peer_status(pc_id) is None:
+                continue
+            try:
+                signed_command = json.loads(raw)
+                peer, _status = self._prepare_peer_authority(pc_id)
+                result = self._query_command_result(peer, signed_command)
+                if not (result.get("applied") or result.get("definitive")):
+                    self._schedule_pending_retry(pc_id)
+                    continue
+                state = "applied" if result.get("applied") else "not_applied"
+                reason = ("confirmed during automatic reconciliation" if
+                          result.get("applied") else
+                          "target atomically confirmed absence during recovery")
+                self.store.archive_session_command(signed_command, state, reason)
+                self.store.delete_local(key)
+                self.pending_retry_state.pop(pc_id, None)
+                diagnostic_info(
+                    "SESSION", "AUTOMATIC_RECONCILIATION_COMPLETED",
+                    pc=fingerprint(pc_id),
+                    op=fingerprint(signed_command["command"]["id"]),
+                    result=state,
+                )
+                self.notify("changed")
+            except Exception as error:
+                self._schedule_pending_retry(pc_id)
+                diagnostic_warning(
+                    "SESSION", "AUTOMATIC_RECONCILIATION_RETRY",
+                    pc=fingerprint(pc_id), error_type=type(error).__name__,
+                    reason=str(error),
+                )
+
     def _remote_session_action(self, action: str, pc_id: str,
                                details: dict) -> dict:
         with self.lock:
@@ -1549,44 +1845,15 @@ class Runtime:
                 raise RuntimeError(
                     "Stop this PC's retainer session before ordinary session controls."
                 )
-            peer = next((p for p in self.store.peers() if p["pc_id"] == pc_id), None)
-            if not peer or time.time() - peer["last_seen"] > PEER_ONLINE_SECONDS:
-                raise RuntimeError("Target PC is offline; session control is unavailable.")
+            # A failed prerequisite refresh must never create a blocking command.
+            peer, _ = self._prepare_peer_authority(pc_id)
             pending_key = f"pending_session_command:{snap['pool_id']}:{pc_id}"
-            saved = self.store.local(pending_key)
-            if saved:
-                signed_command = json.loads(saved)
-                previous = signed_command["command"]
-                same_action = previous["action"] == action and previous["details"] == details
-                if not same_action or previous["term"] != snap["active_admin"]["term"]:
-                    # Ask the owner before replacing an uncertain command.
-                    records = self.network.call(peer["ip"], "session_records", {})["records"]
-                    for item in records:
-                        if item["payload"]["pc_id"] == pc_id:
-                            self.store.merge_owner_record(item)
-                    owner = next((item["payload"] for item in records
-                                  if item["payload"]["pc_id"] == pc_id), None)
-                    applied = bool(owner and (any(
-                        item["command"]["id"] == previous["id"]
-                        for item in owner["grants"]) or
-                        (owner.get("history_clear") or {}).get("command", {}).get("id")
-                        == previous["id"]))
-                    if applied:
-                        status = self.network.call(peer["ip"], "status", {})
-                        if action != "clear_history" and not status.get("access_ready"):
-                            raise RuntimeError("Previous command saved, but desktop access is not confirmed.")
-                        self.store.delete_local(pending_key)
-                        if same_action:
-                            return self.snapshot()
-                        saved = None
-                    elif previous["term"] != snap["active_admin"]["term"]:
-                        self.store.delete_local(pending_key)
-                        saved = None
-                if saved and not same_action:
-                    raise RuntimeError(
-                        "A previous session command has an uncertain result. "
-                        "Retry that command before sending a different one.")
-            if not saved:
+            signed_command, already_complete = self._resolve_pending_command(
+                pc_id, peer, action, details)
+            if already_complete:
+                return self.snapshot()
+            if signed_command is None:
+                snap = self.snapshot()
                 session = snap["sessions"].get(pc_id)
                 command = {
                     "id": uuid.uuid4().hex, "pool_id": snap["pool_id"],
@@ -1603,20 +1870,57 @@ class Runtime:
                     "admin_proof": sign_admin_proof(self.admin_signing_key, command),
                 }
                 self.store.set_local(pending_key, json.dumps(signed_command))
-            # The target must see this Admin claim before checking the command.
-            self.network.call(peer["ip"], "push_snapshot", {"snapshot": snap})
-            reply = self.network.call(peer["ip"], "session_command", signed_command)
+                diagnostic_info("SESSION", "COMMAND_CREATED",
+                                pc=fingerprint(pc_id), op=fingerprint(command["id"]),
+                                action=action, term=command["term"])
+            command = signed_command["command"]
+            try:
+                diagnostic_info("SESSION", "COMMAND_SENT",
+                                pc=fingerprint(pc_id), op=fingerprint(command["id"]),
+                                action=command["action"])
+                reply = self.network.call(
+                    peer["ip"], "session_command", signed_command)
+            except Exception as original_error:
+                diagnostic_warning("SESSION", "COMMAND_DELIVERY_UNCERTAIN",
+                                   pc=fingerprint(pc_id),
+                                   op=fingerprint(command["id"]),
+                                   action=command["action"],
+                                   error_type=type(original_error).__name__,
+                                   reason=str(original_error))
+                try:
+                    result = self._query_command_result(peer, signed_command)
+                except Exception:
+                    self._schedule_pending_retry(pc_id)
+                    raise RuntimeError(
+                        "Session command result is uncertain. GameGrid will "
+                        "reconcile it automatically after reconnection.") from original_error
+                if not result.get("applied"):
+                    if result.get("definitive"):
+                        self.store.archive_session_command(
+                            signed_command, "not_applied",
+                            f"target rejected command: {type(original_error).__name__}")
+                        self.store.delete_local(pending_key)
+                    raise original_error
+                reply = {"target": pc_id, "saved": True,
+                         "record": result.get("record"),
+                         "access_ready": result.get("access_ready", False)}
             if reply.get("target") != pc_id or not reply.get("saved"):
                 raise RuntimeError("Target did not confirm the local session write.")
+            if reply.get("record"):
+                self.store.merge_owner_record(reply["record"])
+            self.store.archive_session_command(
+                signed_command, "applied", "authenticated acknowledgment received")
+            self.store.delete_local(pending_key)
+            self.pending_retry_state.pop(pc_id, None)
             if action != "clear_history" and not reply.get("access_ready"):
                 raise RuntimeError(
                     "Target saved the session command but could not confirm desktop access. "
-                    "Check the User Console and retry the same action.")
-            if reply.get("record"):
-                self.store.merge_owner_record(reply["record"])
-            self.store.delete_local(pending_key)
+                    "Check the User Console; the saved operation will not be repeated.")
             if action in ("start", "end"):
                 self.change(lambda state: state["unlock_requests"].pop(pc_id, None))
+            diagnostic_info("SESSION", "COMMAND_ACKNOWLEDGED",
+                            pc=fingerprint(pc_id), op=fingerprint(command["id"]),
+                            action=command["action"], result="applied")
             self.notify("changed")
             return self.snapshot()
 
@@ -1676,6 +1980,8 @@ class Runtime:
         secret = ""
         with self.lock:
             self._require_customer_admin()
+            diagnostic_info("COMPUTER", "REMOVAL_REQUESTED",
+                            pc=fingerprint(pc_id), forced=False)
             snap = self.snapshot()
             existing = snap.get("revocations", {}).get(pc_id)
             if pc_id not in snap["members"]:
@@ -1687,6 +1993,13 @@ class Runtime:
             if pc_id == snap["active_admin"].get("pc_id"):
                 raise ValueError("The active Admin PC cannot be removed.")
             member = dict(snap["members"][pc_id])
+            peer = next((item for item in self.store.peers()
+                         if item["pc_id"] == pc_id), None)
+            if self.store.local(
+                    f"pending_session_command:{snap['pool_id']}:{pc_id}") \
+                    and peer and self.peer_status(pc_id):
+                self._reconcile_pending_commands()
+                snap = self.snapshot()
             if snap["sessions"].get(pc_id):
                 raise RuntimeError(
                     "End this PC's active gaming session before removing it.")
@@ -1718,9 +2031,8 @@ class Runtime:
                 snap, notice, pc_id, member["public_key"],
                 member["authorization_id"])
 
-            peer = next((item for item in self.store.peers()
-                         if item["pc_id"] == pc_id), None)
             if peer and self.peer_status(pc_id):
+                self._prepare_peer_authority(pc_id)
                 reply = self.network.call(peer["ip"],
                                           "prepare_pairing_removal",
                                           {"revocation": notice})
@@ -1781,22 +2093,104 @@ class Runtime:
                 pass
         self.notify("changed")
         self._replicate_once()
+        diagnostic_info("COMPUTER", "REMOVAL_COMPLETED",
+                        pc=fingerprint(pc_id), forced=False,
+                        revision=updated["revision"])
         return {"removed": True, "already_removed": False,
                 "pc_id": pc_id, "pc_name": member["name"],
                 "revision": updated["revision"]}
+
+    def force_remove_computer(self, pc_id: str) -> dict:
+        """Revoke an unreachable identity while preserving unresolved evidence."""
+        with self.lock:
+            self._require_customer_admin()
+            diagnostic_warning("COMPUTER", "FORCE_REMOVE_CONFIRMED",
+                               pc=fingerprint(pc_id))
+            snap = self.snapshot()
+            if pc_id not in snap["members"]:
+                raise ValueError("Choose a registered User PC.")
+            if pc_id == snap["active_admin"].get("pc_id"):
+                raise ValueError("The active Admin PC cannot be removed.")
+            member = dict(snap["members"][pc_id])
+            peer = next((item for item in self.store.peers()
+                         if item["pc_id"] == pc_id), None)
+            if peer:
+                try:
+                    status = self.network.call(peer["ip"], "status", {})
+                    if status.get("pc_id") == pc_id:
+                        self.store.note_peer(pc_id, peer["ip"])
+                        self.peer_statuses[pc_id] = (time.time(), status)
+                        raise RuntimeError(
+                            "This computer is reachable. Its state was refreshed; "
+                            "use normal Remove Computer after active gameplay ends.")
+                except RuntimeError:
+                    raise
+                except Exception:
+                    pass
+
+            pending_key = f"pending_session_command:{snap['pool_id']}:{pc_id}"
+            pending_raw = self.store.local(pending_key)
+            pending = json.loads(pending_raw) if pending_raw else None
+            owner_record = next((item for item in self.store.owner_records()
+                                 if item["payload"]["pc_id"] == pc_id), None)
+            ownership = self.store.customer_ownership(pc_id=pc_id)
+            certificate = {
+                "version": 1, "pool_id": snap["pool_id"], "pc_id": pc_id,
+                "pc_name": member["name"], "public_key": member["public_key"],
+                "authorization_id": member["authorization_id"],
+                "revocation_id": uuid.uuid4().hex,
+                "revision": int(snap["revision"]) + 1,
+                "revoked_at": time.time(), "removed_by": self.store.pc_id,
+            }
+            notice = {
+                "certificate": certificate,
+                "signing_public": snap["admin_signing"]["public"],
+                "signature": sign_admin_proof(
+                    self.admin_signing_key, certificate),
+            }
+            verify_pairing_revocation(
+                snap, notice, pc_id, member["public_key"],
+                member["authorization_id"])
+            evidence = {
+                "member": member,
+                "session": snap["sessions"].get(pc_id),
+                "owner_record": owner_record,
+                "pending_command": pending,
+                "customer_ownership": ownership,
+                "revocation": notice,
+                "warning": ("The offline PC was not contacted; lock and session "
+                            "completion were not confirmed."),
+            }
+
+            updated = self.store.commit_forced_removal(
+                pc_id, member["authorization_id"], notice, evidence, pending)
+            self.store.forget_peer(pc_id)
+            self.peer_statuses.pop(pc_id, None)
+            self.connection_states.pop(pc_id, None)
+            self.peer_failures.pop(pc_id, None)
+            diagnostic_warning(
+                "COMPUTER", "FORCE_REMOVE_COMPLETED",
+                pc=fingerprint(pc_id), name=member["name"],
+                had_session=bool(evidence["session"]),
+                had_pending=bool(pending), had_customer=bool(ownership),
+                revision=updated["revision"],
+            )
+        self.notify("changed")
+        self._replicate_once()
+        return {"removed": True, "forced": True, "pc_id": pc_id,
+                "pc_name": member["name"], "revision": updated["revision"]}
 
     def remote_exit(self, pc_id: str) -> dict:
         self._require_admin()
         snap = self.snapshot()
         if pc_id == self.store.pc_id or pc_id not in snap["members"]:
             raise ValueError("Choose a registered User PC.")
-        status = self.peer_status(pc_id)
-        peer = next((item for item in self.store.peers()
-                     if item["pc_id"] == pc_id), None)
-        if not status or not peer:
-            raise RuntimeError("Target PC is offline; Exit Software is unavailable.")
         try:
-            self.network.call(peer["ip"], "push_snapshot", {"snapshot": snap})
+            peer, _status = self._prepare_peer_authority(pc_id)
+            pending_key = f"pending_session_command:{snap['pool_id']}:{pc_id}"
+            if self.store.local(pending_key):
+                self._resolve_pending_command(pc_id, peer, "remote_exit", {})
+                snap = self.snapshot()
             reply = self.network.call(peer["ip"], "remote_exit",
                                       {"term": snap["active_admin"]["term"]})
         except Exception as error:
@@ -1833,6 +2227,38 @@ class Runtime:
         snap = self.snapshot()
         if not snap or not verify_password(password, snap.get("admin_password", {})):
             raise PermissionError("Incorrect Admin password.")
+        active = snap["active_admin"]
+        remote_admin = active.get("pc_id")
+        if remote_admin and remote_admin != self.store.pc_id:
+            ip = self.active_admin_ip()
+            status = self.peer_status(remote_admin)
+            if ip:
+                try:
+                    fresh = self.network.call(ip, "status", {})
+                    if (fresh.get("pc_id") == remote_admin
+                            and fresh.get("admin")
+                            and int(fresh.get("admin_term", -1))
+                            == int(active.get("term", 0))):
+                        if int(fresh.get("authority_protocol", 0)) \
+                                != AUTHORITY_PROTOCOL:
+                            raise RuntimeError(
+                                "Admin is reachable but uses an incompatible "
+                                "authority protocol. Update every cafe PC.")
+                        self.peer_statuses[remote_admin] = (time.time(), fresh)
+                        self._note_admin_claim(
+                            remote_admin, int(active.get("term", 0)))
+                        status = fresh
+                except RuntimeError:
+                    raise
+                except Exception:
+                    pass
+            if (status and status.get("admin")
+                    and status.get("pc_id") == remote_admin
+                    and int(status.get("admin_term", -1))
+                    == int(active.get("term", 0))):
+                raise RuntimeError(
+                    "Admin is online. Start or change this session from the "
+                    "Admin Dashboard.")
         signing_key = unlock_admin_signing_key(password, snap["admin_signing"])
         if action not in ("start", "add") or len(operation_id) != 32:
             raise ValueError("Invalid local Staff operation.")
@@ -1913,10 +2339,14 @@ class Runtime:
                 self._require_pairing_available()
             snap = self.snapshot()
             command = data["command"]
-            claim = snap["active_admin"]
-            if (sender != claim["pc_id"] or sender != command["admin_id"]
-                    or claim["expires_at"] <= time.time()
-                    or command["term"] != claim["term"]
+            diagnostic_info("SESSION", "COMMAND_RECEIVED",
+                            pc=fingerprint(self.store.pc_id),
+                            admin=fingerprint(sender),
+                            op=fingerprint(command.get("id")),
+                            action=command.get("action"),
+                            term=command.get("term"))
+            claim = self._require_remote_admin(sender, command.get("term"))
+            if (sender != command["admin_id"]
                     or command["pool_id"] != snap["pool_id"]
                     or command["target"] != self.store.pc_id):
                 raise PermissionError("Only the current Admin can control this session.")
@@ -1980,12 +2410,23 @@ class Runtime:
                         snap["members"][self.store.pc_id]["name"],
                         details.get("reason", "admin"), now)
                     history.append(record)
+                    diagnostic_info(
+                        "SESSION", "SESSION_COMPLETED",
+                        pc=fingerprint(self.store.pc_id),
+                        session=fingerprint(record["id"]),
+                        reason=record.get("reason"),
+                        duration_seconds=record.get("counted_seconds", 0),
+                        result="persisting")
                     session = None
                 else:
                     raise ValueError("Unsupported session command.")
             grants.append(data)
             record = self._save_owner_state(session, history, grants)
             self._reconcile_local_access()
+            diagnostic_info("SESSION", "COMMAND_SAVED",
+                            pc=fingerprint(self.store.pc_id),
+                            op=fingerprint(command["id"]), action=action,
+                            session=fingerprint(command.get("session_id")))
             return {"target": self.store.pc_id, "saved": True,
                     "record": record, "access_ready": self._local_access_ready()}
 
@@ -2068,6 +2509,8 @@ class Runtime:
         self.store.decide_join(request_id, "accepted",
                                seal_welcome(shared, request_id, welcome))
         self.store.remember_address(pc_id, pending["ip"])
+        diagnostic_info("PAIRING", "PAIRING_APPROVED",
+                        pc=fingerprint(pc_id), name=name, ip=pending["ip"])
 
     def reject_join(self, request_id: str) -> None:
         self._require_admin()
@@ -2082,6 +2525,19 @@ class Runtime:
             return {"snapshot": snap}
         if operation == "session_records":
             return {"records": self.store.owner_records()}
+        if operation == "command_status":
+            with self.lock:
+                self._require_remote_admin(sender, data.get("term"))
+                command_id = str(data.get("command_id", ""))
+                if len(command_id) != 32:
+                    raise ValueError("Invalid session command identifier.")
+                record = next((item for item in self.store.owner_records()
+                               if item["payload"]["pc_id"] == self.store.pc_id), None)
+                owner = record["payload"] if record else None
+                applied = self._command_applied(owner, command_id)
+                return {"target": self.store.pc_id, "applied": applied,
+                        "definitive": True, "record": record,
+                        "access_ready": self._local_access_ready()}
         if operation == "session_record":
             record = data["record"]
             if record["payload"]["pc_id"] != sender:
@@ -2098,12 +2554,10 @@ class Runtime:
         if operation == "prepare_pairing_removal":
             with self.lock:
                 snap = self.snapshot()
-                claim = snap["active_admin"]
+                claim = self._require_remote_admin(sender)
                 member = snap["members"].get(self.store.pc_id)
                 notice = data.get("revocation")
-                if (sender != claim.get("pc_id")
-                        or claim.get("expires_at", 0) <= time.time()
-                        or not member):
+                if not member:
                     raise PermissionError(
                         "Only the active Admin can prepare a PC removal.")
                 certificate = verify_pairing_revocation(
@@ -2130,22 +2584,16 @@ class Runtime:
                 }
                 return {"ready": True, "target": self.store.pc_id}
         if operation == "cancel_pairing_removal":
-            claim = snap["active_admin"]
-            if (sender != claim.get("pc_id")
-                    or claim.get("expires_at", 0) <= time.time()):
-                raise PermissionError(
-                    "Only the active Admin can cancel a PC removal.")
+            self._require_remote_admin(sender)
             removal = self.pairing_removal
             if (removal and removal.get("revocation_id") ==
                     data.get("revocation_id")):
                 self.pairing_removal = None
             return {"cancelled": True, "target": self.store.pc_id}
         if operation == "pairing_revoked":
-            claim = snap["active_admin"]
+            self._require_remote_admin(sender)
             member = snap["members"].get(self.store.pc_id)
-            if (sender != claim.get("pc_id")
-                    or claim.get("expires_at", 0) <= time.time()
-                    or not member):
+            if not member:
                 raise PermissionError(
                     "Only the active Admin can revoke this pairing.")
             certificate = verify_pairing_revocation(
@@ -2161,11 +2609,8 @@ class Runtime:
                     "Pairing removal cannot interrupt active gameplay.")
             return {"accepted": True, "target": self.store.pc_id}
         if operation == "remote_exit":
-            claim = snap["active_admin"]
-            if (sender != claim.get("pc_id") or
-                    claim.get("expires_at", 0) <= time.time() or
-                    int(data.get("term", -1)) != claim.get("term") or
-                    self.store.pc_id == sender):
+            self._require_remote_admin(sender, data.get("term"))
+            if self.store.pc_id == sender:
                 raise PermissionError("Only the active Admin can exit a User PC.")
             self.prepare_local_shutdown()
             return {"accepted": True, "target": self.store.pc_id,
@@ -2308,7 +2753,7 @@ class Runtime:
 
                 committed = self.store.update(commit)
                 transfer["committed_snapshot"] = committed
-                self.handoff_until = time.time() + 30
+                self.handoff_deadline = time.monotonic() + 30
                 self.store.set_local(self._lease_key("handed_off"),
                                      str(active["term"]))
                 self.store.set_local(self._lease_key("until"), "0")
@@ -2331,10 +2776,12 @@ class Runtime:
             incoming = data.get("snapshot")
             if not isinstance(incoming, dict) or incoming.get("pool_id") != snap["pool_id"]:
                 raise ValueError("Invalid pool snapshot.")
-            lease = incoming.get("active_admin", {})
-            if lease.get("expires_at", 0) < time.time():
-                raise PermissionError("Admin claim has expired.")
+            if int(incoming.get("authority_protocol", 0)) != AUTHORITY_PROTOCOL:
+                raise RuntimeError(
+                    "Incompatible Admin authority protocol; update every cafe PC.")
             applied = self.accept_admin_snapshot(incoming, sender)
+            claim = incoming["active_admin"]
+            self._note_admin_claim(sender, int(claim["term"]))
             self.notify("changed")
             self._reconcile_local_access()
             return {"revision": self.snapshot()["revision"], "applied": applied,
@@ -2342,12 +2789,7 @@ class Runtime:
                     "access_ready": self._local_access_ready(),
                     "wallpaper_id": self.store.current_wallpaper_id()}
         if operation == "wallpaper_sync":
-            claim = self.snapshot()["active_admin"]
-            if (sender != claim.get("pc_id") or
-                    claim.get("expires_at", 0) <= time.time()):
-                raise PermissionError(
-                    "Only the active Admin can synchronize the locked wallpaper."
-                )
+            self._require_remote_admin(sender)
             metadata = data.get("metadata")
             encoded = data.get("content")
             if not isinstance(metadata, dict) or not isinstance(encoded, str):
@@ -2360,12 +2802,7 @@ class Runtime:
             self.notify("changed")
             return {"wallpaper_id": wallpaper_id}
         if operation == "customer_sync":
-            claim = snap["active_admin"]
-            if (sender != claim.get("pc_id") or
-                    claim.get("expires_at", 0) <= time.time()):
-                raise PermissionError(
-                    "Only the active Admin can synchronize customer accounts."
-                )
+            self._require_remote_admin(sender)
             accounts = data.get("accounts", [])
             tombstones = data.get("tombstones", [])
             if not isinstance(accounts, list) or not isinstance(tombstones, list):
@@ -2378,12 +2815,7 @@ class Runtime:
             with self.lock:
                 return self._handle_customer_access(data, sender)
         if operation == "retainer_control":
-            claim = snap["active_admin"]
-            if (sender != claim.get("pc_id") or
-                    claim.get("expires_at", 0) <= time.time()):
-                raise PermissionError(
-                    "Only the active Admin can stop registered customer access."
-                )
+            self._require_remote_admin(sender)
             self._apply_retainer_control(data)
             return {"target": self.store.pc_id,
                     "locked": not self._local_access_ready()}
@@ -2492,6 +2924,18 @@ class Runtime:
         wallpaper = self.store.wallpaper_content()
 
         def push(peer: dict) -> tuple[dict, dict]:
+            reported = self.peer_status(peer["pc_id"])
+            if (not reported or int(reported.get("authority_protocol", 0))
+                    != AUTHORITY_PROTOCOL):
+                # Refresh stale discovery metadata before deciding that a peer
+                # cannot participate in the current authority protocol.
+                reported = self.network.call(peer["ip"], "status", {})
+                if (reported.get("pc_id") != peer["pc_id"]
+                        or int(reported.get("authority_protocol", 0))
+                        != AUTHORITY_PROTOCOL):
+                    raise RuntimeError(
+                        "Peer authority protocol is unavailable or incompatible.")
+                self.peer_statuses[peer["pc_id"]] = (time.time(), reported)
             pool_reply = self.network.call(
                 peer["ip"], "push_snapshot", {"snapshot": snap})
             if (wallpaper and
@@ -2528,8 +2972,22 @@ class Runtime:
                             "Peer did not acknowledge durable customer revisions."
                         )
                     self.store.note_customer_sync(peer["pc_id"], acknowledgments)
+                    if self.customer_sync_errors.pop(peer["pc_id"], None) is not None:
+                        diagnostic_info(
+                            "CUSTOMER_SYNC", "SYNC_RECOVERED",
+                            pc=fingerprint(peer["pc_id"]),
+                            revisions=len(acknowledgments),
+                        )
                 except Exception as error:
                     self.store.note_customer_sync(peer["pc_id"], {}, str(error))
+                    message = str(error)[:240]
+                    if self.customer_sync_errors.get(peer["pc_id"]) != message:
+                        diagnostic_warning(
+                            "CUSTOMER_SYNC", "SYNC_FAILED",
+                            pc=fingerprint(peer["pc_id"]),
+                            error_type=type(error).__name__, reason=message,
+                        )
+                    self.customer_sync_errors[peer["pc_id"]] = message
                     # The next sync pass retries both pool and customer state.
 
     def _poll_peer_statuses(self) -> None:
@@ -2552,6 +3010,7 @@ class Runtime:
                     if status.get("pc_id") != item["pc_id"]:
                         continue
                     successful.add(item["pc_id"])
+                    self.peer_failures[item["pc_id"]] = 0
                     self.store.note_peer(item["pc_id"], item["ip"])
                     with self.lock:
                         self.peer_statuses[item["pc_id"]] = (time.time(), status)
@@ -2563,15 +3022,33 @@ class Runtime:
                             and self.is_admin()):
                         self._record_member_connection(item["pc_id"])
                         self._record_peer_notification(item["pc_id"], "online")
+                        diagnostic_info("NETWORK", "CONNECTION_RESTORED",
+                                        pc=fingerprint(item["pc_id"]),
+                                        ip=item["ip"])
+                    elif previous is None:
+                        diagnostic_info("NETWORK", "CONNECTION_ESTABLISHED",
+                                        pc=fingerprint(item["pc_id"]),
+                                        ip=item["ip"])
+                    active = snap["active_admin"]
+                    if (item["pc_id"] == active.get("pc_id")
+                            and status.get("admin")
+                            and int(status.get("admin_term", -1))
+                            == int(active.get("term", 0))
+                            and int(status.get("authority_protocol", 0))
+                            == AUTHORITY_PROTOCOL):
+                        self._note_admin_claim(
+                            item["pc_id"], int(active.get("term", 0)))
                     records = self.network.call(item["ip"], "session_records", {})["records"]
                     for record in records:
                         if self.store.merge_owner_record(record):
                             self.notify("changed")
                 except Exception:
-                    pass
+                    self.peer_failures[item["pc_id"]] = (
+                        self.peer_failures.get(item["pc_id"], 0) + 1)
         for item in peers:
             pc_id = item["pc_id"]
-            if pc_id not in successful and self.peer_status(pc_id) is None:
+            if (pc_id not in successful and self.peer_status(pc_id) is None
+                    and self.peer_failures.get(pc_id, 0) >= 2):
                 previous = self.connection_states.get(pc_id)
                 graceful = pc_id in self.graceful_disconnects
                 self.graceful_disconnects.discard(pc_id)
@@ -2579,6 +3056,9 @@ class Runtime:
                 if previous is True and not graceful and self.is_admin():
                     self._record_peer_notification(pc_id, "offline")
                     self._release_disconnected_customer(pc_id, "pc_offline")
+                    diagnostic_warning("NETWORK", "CONNECTION_LOST",
+                                       pc=fingerprint(pc_id), ip=item["ip"],
+                                       failures=self.peer_failures.get(pc_id, 0))
 
     def _record_peer_notification(self, pc_id: str, event_type: str) -> None:
         """Snapshot the event-time name while retaining the immutable PC ID."""
@@ -2821,6 +3301,12 @@ class Runtime:
                 if not self.store.current_pool_id:
                     self.stop_event.wait(SYNC_INTERVAL_SECONDS)
                     continue
+                snap = self.snapshot()
+                if (snap and snap["active_admin"].get("pc_id") == self.store.pc_id
+                        and self.local_claim_deadline <= time.monotonic()):
+                    # Sleep/resume or a local clock adjustment must not strand
+                    # the still-designated, cryptographically proven Admin.
+                    self._resume_designated_admin()
                 if self.is_admin() and time.monotonic() - last_renew >= 5:
                     self._renew_admin_lease()
                     last_renew = time.monotonic()
@@ -2828,6 +3314,7 @@ class Runtime:
                 if not self.store.current_pool_id:
                     continue
                 self._poll_peer_statuses()
+                self._reconcile_pending_commands()
                 if not self.store.current_pool_id:
                     continue
                 self.update_admin_connection_note()
@@ -2839,5 +3326,9 @@ class Runtime:
                 self._replicate_once()
                 self._reconcile_local_access()
             except Exception as error:
+                diagnostic_unexpected(
+                    "RUNTIME", "BACKGROUND_ITERATION_FAILED", error,
+                    pc=fingerprint(self.store.pc_id),
+                    admin=self.is_admin())
                 self.notify("error", str(error))
             self.stop_event.wait(SYNC_INTERVAL_SECONDS)

@@ -7,6 +7,8 @@ import os
 import threading
 import time
 
+from .diagnostics import info
+
 
 PROCESS_RUN_ID = f"{os.getpid()}-{time.time_ns():x}"
 _enabled = False
@@ -26,6 +28,7 @@ def lifecycle_event(stage: str, **details) -> None:
     """Write one line to the existing per-process log without risking shutdown."""
     if not _enabled:
         return
+    info("LIFECYCLE", stage, run=PROCESS_RUN_ID, pid=os.getpid(), **details)
     fields = " ".join(f"{key}={value}" for key, value in details.items())
     line = (
         f"{datetime.now().astimezone().isoformat(timespec='milliseconds')} "

@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import copy
 import json
 import time
 import unittest
@@ -119,6 +120,36 @@ class AdminHandoffTest(unittest.TestCase):
         self.assertFalse(any(customer_controls(
             self.second.snapshot(), self.second.pc_id).values()))
 
+    def test_transfer_reports_real_stages_until_commit_is_verified(self):
+        self.admin.login_admin(PASSWORD)
+        stages = []
+        self.user.take_admin(PASSWORD, stages.append)
+        self.assertTrue(self.user.is_admin())
+        self.assertEqual(stages[0], "Authenticating Admin authority")
+        self.assertIn("Preparing Admin transfer", stages)
+        self.assertIn("Transferring authoritative data", stages)
+        self.assertIn("Verifying and saving transferred data", stages)
+        self.assertIn("Finalizing Admin authority", stages)
+        self.assertEqual(stages[-1], "Admin authority transfer completed")
+
+    def test_old_admin_term_replay_cannot_regain_authority(self):
+        self.admin.login_admin(PASSWORD)
+        old_snapshot = copy.deepcopy(self.first.snapshot())
+        old_term = old_snapshot["active_admin"]["term"]
+        self.user.take_admin(PASSWORD)
+        current_term = self.second.snapshot()["active_admin"]["term"]
+        self.assertGreater(current_term, old_term)
+
+        reply = self.user.handle_member(
+            "push_snapshot", {"snapshot": old_snapshot},
+            self.first.pc_id, "first")
+        self.assertFalse(reply["applied"])
+        self.assertEqual(
+            self.second.snapshot()["active_admin"]["pc_id"],
+            self.second.pc_id)
+        with self.assertRaises(PermissionError):
+            self.user._require_remote_admin(self.first.pc_id, old_term)
+
     def test_transfer_preserves_removed_membership_revocation(self):
         self.admin.login_admin(PASSWORD)
         removed_id = self.offline_ids[0]
@@ -133,6 +164,27 @@ class AdminHandoffTest(unittest.TestCase):
         self.assertTrue(self.user.is_admin())
         self.assertNotIn(removed_id, transferred["members"])
         self.assertEqual(transferred["revocations"][removed_id], notice)
+
+    def test_transfer_preserves_force_remove_audit_evidence(self):
+        self.admin.login_admin(PASSWORD)
+        removed_id = self.offline_ids[0]
+        self.first.update(lambda state: state["sessions"].update({
+            removed_id: {
+                "id": "e" * 32, "kind": "open", "paid_minutes": 0,
+                "buffer_minutes": 0, "started_at": time.time(),
+                "paused_at": None, "paused_seconds": 0,
+                "grace_started": None, "player": "Guest",
+            }}))
+        self.admin.force_remove_computer(removed_id)
+        source_audit = self.first.removed_computer_audit(removed_id)
+        self.assertEqual(len(source_audit), 1)
+
+        self.user.take_admin(PASSWORD)
+        transferred = self.second.removed_computer_audit(removed_id)
+        self.assertEqual(len(transferred), 1)
+        self.assertEqual(
+            transferred[0]["evidence"]["session"]["id"], "e" * 32)
+        self.assertIn(removed_id, self.second.snapshot()["revocations"])
 
     def test_customer_authority_survives_transfer_both_directions(self):
         customer = self.first.create_customer(
@@ -218,7 +270,7 @@ class AdminHandoffTest(unittest.TestCase):
         created_under_b = self.second.create_customer(
             "Created Under B", "Owner", "create-under-b")
 
-        self.admin.handoff_until = 0
+        self.admin.handoff_deadline = 0
         self.admin.take_admin(PASSWORD)
         latest = self.first.customer_password_verifier(customer["customer_id"])
         self.assertTrue(verify_password("password-under-b", latest))
@@ -357,6 +409,7 @@ class AdminHandoffTest(unittest.TestCase):
             "pc_id": self.first.pc_id,
             "admin": True,
             "admin_term": snapshot["active_admin"]["term"],
+            "authority_protocol": 2,
         })
         with patch("game_cafe.runtime.time.time",
                    return_value=observed_at + PEER_ONLINE_SECONDS - 0.1):

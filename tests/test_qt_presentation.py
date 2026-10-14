@@ -494,7 +494,10 @@ class QtPresentationTest(unittest.TestCase):
         self.bridge.claimAdmin("correct password")
         self.wait_for_idle()
         self.assertEqual(self.bridge.mode, "admin")
-        self.runtime.take_admin.assert_called_once_with("correct password")
+        self.runtime.take_admin.assert_called_once()
+        call = self.runtime.take_admin.call_args
+        self.assertEqual(call.args[0], "correct password")
+        self.assertTrue(callable(call.args[1]))
         self.host.stop_console.assert_called_once()
 
     def test_dashboard_history_width_and_avatar_preview_are_bounded(self):
@@ -665,6 +668,10 @@ class QtPresentationTest(unittest.TestCase):
         self.assertIn('visible: rowData.canRemove', qml)
         self.assertIn('" (ID: " + rowData.pcId', qml)
         self.assertIn('bridge.removeComputer(rowData.pcId)', qml)
+        self.assertIn('text: "Force Remove"', qml)
+        self.assertIn('visible: rowData.canForceRemove', qml)
+        self.assertIn('rowData.pcFingerprint', qml)
+        self.assertIn('bridge.forceRemoveComputer(rowData.pcId)', qml)
 
     def test_remove_computer_routes_by_immutable_id_and_clears_selection(self):
         pc_id = "a" * 32
@@ -683,6 +690,39 @@ class QtPresentationTest(unittest.TestCase):
         self.assertEqual(self.bridge.selectedPcId, "")
         self.assertEqual(self.bridge.expandedPcId, "")
         self.assertEqual(self.bridge.notice["title"], "Computer removed")
+
+    def test_force_remove_routes_by_immutable_id_and_clears_selection(self):
+        pc_id = "b" * 32
+        self.bridge.member_model.update_rows([{
+            "pcId": pc_id, "name": "PC-02", "canForceRemove": True,
+        }])
+        self.bridge._selected_pc = pc_id
+        self.bridge._expanded_pc = pc_id
+        self.runtime.force_remove_computer.return_value = {
+            "removed": True, "forced": True, "pc_id": pc_id,
+            "pc_name": "PC-02"}
+
+        self.bridge.forceRemoveComputer(pc_id)
+        self.wait_for_idle()
+
+        self.runtime.force_remove_computer.assert_called_once_with(pc_id)
+        self.assertEqual(self.bridge.selectedPcId, "")
+        self.assertEqual(self.bridge.expandedPcId, "")
+        self.assertEqual(self.bridge.notice["title"],
+                         "Computer force removed")
+
+    def test_start_new_session_routes_through_safe_replacement(self):
+        pc_id = "replacement-target"
+        self.bridge.pc_model.update_rows([{
+            "pcId": pc_id, "name": "PC-02", "start": False,
+            "replace": True,
+        }])
+        with patch.object(self.bridge, "refresh"):
+            self.bridge.startSession(pc_id, "timed", "45", "5")
+            self.wait_for_idle()
+        self.runtime.replace_session.assert_called_once_with(
+            pc_id, kind="timed", paid_minutes=45, buffer_minutes=5)
+        self.runtime.admin_action.assert_not_called()
 
     def test_designated_admin_node_offers_admin_or_user_when_not_logged_in(self):
         snapshot, secret = new_pool("Cafe", self.store.pc_id, "PC-01", "Admin",

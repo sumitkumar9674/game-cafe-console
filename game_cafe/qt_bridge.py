@@ -79,6 +79,7 @@ class CafeBridge(QObject):
     noticeChanged = Signal()
     staffAuthChanged = Signal()
     workFinished = Signal(str, object, object)
+    progressRequested = Signal(str)
 
     def __init__(self, store: Store, host, runtime: Runtime | None = None,
                  child: bool = False):
@@ -131,6 +132,7 @@ class CafeBridge(QObject):
         self.customer_model = RecordListModel("customerId", self)
         self.customer_adjustment_model = RecordListModel("adjustmentId", self)
         self.workFinished.connect(self._on_work_finished)
+        self.progressRequested.connect(self._set_status)
         self.tick_timer = QTimer(self)
         self.tick_timer.timeout.connect(self.tick)
         self.tick_timer.start(300 if child else 250)
@@ -427,7 +429,8 @@ class CafeBridge(QObject):
             else:
                 self._set_status("Admin authenticated. Preparing the dashboard")
                 self._enter_admin()
-        self._submit("claim", lambda: self.runtime.take_admin(password),
+        self._submit("claim", lambda: self.runtime.take_admin(
+            password, self.progressRequested.emit),
                      done, blocking=True)
 
     @Slot()
@@ -746,7 +749,7 @@ class CafeBridge(QObject):
                         "timeText": duration(state["retainerBalanceSeconds"]),
                         "detail": "Retainer active · " + duration(
                             state["retainerBalanceSeconds"]) + " remaining",
-                        "start": False, "add": False, "pause": False,
+                        "start": False, "replace": False, "add": False, "pause": False,
                         "resume": False, "lock": False,
                     })
         computer_sort = snap.get("settings", {}).get("computer_sort", "recent")
@@ -836,9 +839,18 @@ class CafeBridge(QObject):
                          "isAdmin": pc_id == admin_id,
                          "canRemove": bool(
                              self.runtime and self.runtime.is_admin()
-                             and pc_id != admin_id),
+                              and pc_id != admin_id
+                              and self.runtime.peer_status(pc_id) is not None),
                          "online": pc_id == own or
                          (self.runtime.peer_status(pc_id) is not None if self.runtime else False),
+                          "canForceRemove": bool(
+                              self.runtime and self.runtime.is_admin()
+                              and pc_id != admin_id
+                              and self.runtime.peer_status(pc_id) is None),
+                          "pcFingerprint": pc_id[:8],
+                          "hasSavedSession": bool(snap["sessions"].get(pc_id)),
+                          "hasPendingCommand": bool(self.store.local(
+                              f"pending_session_command:{snap['pool_id']}:{pc_id}")),
                          "ip": peers.get(pc_id, {}).get("ip", "")}
                         for pc_id, member in snap["members"].items()],
             "historyTargets": [{"pcId": pc_id, "name": member["name"],
@@ -1160,13 +1172,19 @@ class CafeBridge(QObject):
     @Slot(str, str, str, str)
     def startSession(self, pc_id: str, kind: str, paid: str, buffer: str) -> None:
         try:
-            self._eligible(pc_id, "start")
+            row = next((item for item in self.pc_model.rows
+                        if item["pcId"] == pc_id), None)
+            if not row or not (row.get("start") or row.get("replace")):
+                raise ValueError("This action is unavailable for this PC now.")
             paid_minutes, buffer_minutes = validate_start(kind, paid, buffer)
         except Exception as error:
             self._show_notice("Check session details", str(error), True)
             return
-        self._action("start", lambda: self.runtime.admin_action(
-            "start", pc_id, kind=kind, paid_minutes=paid_minutes,
+        operation = self.runtime.replace_session if row.get("replace") else \
+            lambda target, **values: self.runtime.admin_action(
+                "start", target, **values)
+        self._action("start", lambda: operation(
+            pc_id, kind=kind, paid_minutes=paid_minutes,
             buffer_minutes=buffer_minutes))
 
     @Slot(str, int, result=str)
@@ -1261,6 +1279,37 @@ class CafeBridge(QObject):
         self._submit(
             "remove_computer", lambda: self.runtime.remove_computer(pc_id),
             done, blocking=True)
+
+    @Slot(str)
+    def forceRemoveComputer(self, pc_id: str) -> None:
+        target = next((item for item in self.member_model.rows
+                       if item["pcId"] == pc_id), None)
+        if not target or not target.get("canForceRemove"):
+            self._show_notice(
+                "Cannot force remove computer",
+                "Force Remove is available only for an offline registered User PC.",
+                True)
+            return
+
+        def done(result, error):
+            if error:
+                self._show_notice("Computer not removed", str(error), True)
+            else:
+                if self._selected_pc == pc_id:
+                    self._selected_pc = ""
+                if self._expanded_pc == pc_id:
+                    self._expanded_pc = ""
+                self.selectionChanged.emit()
+                self._show_notice(
+                    "Computer force removed",
+                    f"{result['pc_name']} ({pc_id[:8]}) was revoked. Its offline "
+                    "desktop and session outcome were not confirmed.")
+            self.refresh()
+
+        self._submit(
+            "force_remove_computer",
+            lambda: self.runtime.force_remove_computer(pc_id), done,
+            blocking=True)
 
     @Slot(str)
     def clearHistory(self, pc_id: str) -> None:
@@ -1940,7 +1989,7 @@ class CafeBridge(QObject):
             def work():
                 password = open_local_password(self.host.command_private_key,
                                                payload["password_sealed"])
-                self.runtime.take_admin(password)
+                self.runtime.take_admin(password, self.progressRequested.emit)
             def done(result, error):
                 if error:
                     self.store.set_local("customer_feedback",

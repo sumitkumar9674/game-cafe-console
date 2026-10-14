@@ -144,6 +144,7 @@ def pc_row_data(snapshot: dict, pc_id: str, reported: dict | None,
               session["kind"] == "timed" and phase in (
                   "buffer", "timed", "grace", "paused")) and not retainer_active
     can_end = not admin and online and session is not None
+    can_replace = can_end and not retainer_active
     return {
         "pcId": pc_id, "name": snapshot["members"][pc_id]["name"],
         "role": "ADMIN" if admin else "USER", "online": online,
@@ -159,6 +160,7 @@ def pc_row_data(snapshot: dict, pc_id: str, reported: dict | None,
         "startedText": date_text(session["started_at"]) if session else "",
         "unlockRequested": pc_id in snapshot["unlock_requests"],
         "start": can_start, "add": can_add, "end": can_end,
+        "replace": can_replace,
         "pause": not admin and online and bool(session) and phase in (
             "buffer", "timed", "open") and not retainer_active,
         "resume": not admin and online and phase == "paused",

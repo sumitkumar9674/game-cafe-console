@@ -3,6 +3,7 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import copy
+import json
 import time
 import unittest
 from unittest.mock import MagicMock, patch
@@ -225,6 +226,72 @@ class ComputerRemovalTest(unittest.TestCase):
         self.user_store.update(lambda state: state["sessions"].pop(pc_id))
         self.assertTrue(self.user._apply_pending_pairing_revocation())
         self.assertIsNone(self.user_store.current_pool_id)
+
+    def test_force_remove_offline_archives_active_and_pending_evidence(self):
+        pc_id = self.user_store.pc_id
+        history = copy.deepcopy(self.admin_store.snapshot()["history"][pc_id])
+        self.admin_store.update(lambda state: state["sessions"].update({
+            pc_id: sessions.start_session("open", 0, 0)}))
+        command = {
+            "id": "d" * 32,
+            "pool_id": self.admin_store.current_pool_id,
+            "admin_id": self.admin_store.pc_id,
+            "target": pc_id,
+            "term": self.admin_store.snapshot()["active_admin"]["term"],
+            "action": "end", "session_id": "e" * 32,
+            "details": {"reason": "admin"},
+        }
+        pending = {"command": command, "signature": "saved",
+                   "admin_proof": "saved"}
+        key = (f"pending_session_command:"
+               f"{self.admin_store.current_pool_id}:{pc_id}")
+        self.admin_store.set_local(key, json.dumps(pending))
+
+        with (patch.object(self.admin.network, "call",
+                           side_effect=OSError("unreachable")),
+              patch.object(self.admin, "_replicate_once")):
+            result = self.admin.force_remove_computer(pc_id)
+
+        self.assertTrue(result["forced"])
+        snapshot = self.admin_store.snapshot()
+        self.assertNotIn(pc_id, snapshot["members"])
+        self.assertEqual(snapshot["history"][pc_id], history)
+        self.assertIn(pc_id, snapshot["revocations"])
+        self.assertIsNone(self.admin_store.local(key))
+        audit = self.admin_store.removed_computer_audit(pc_id)
+        self.assertEqual(len(audit), 1)
+        self.assertIsNotNone(audit[0]["evidence"]["session"])
+        self.assertEqual(
+            audit[0]["evidence"]["pending_command"]["command"]["id"],
+            command["id"])
+        self.assertEqual(
+            self.admin_store.session_command_audit()[-1]["state"],
+            "archived_force_remove")
+
+    def test_force_remove_refuses_reachable_identity(self):
+        pc_id = self.user_store.pc_id
+        with patch.object(
+                self.admin.network, "call",
+                return_value={"pc_id": pc_id, "authority_protocol": 2}):
+            with self.assertRaisesRegex(RuntimeError, "reachable"):
+                self.admin.force_remove_computer(pc_id)
+        self.assertIn(pc_id, self.admin_store.snapshot()["members"])
+
+    def test_force_remove_targets_id_when_display_names_match(self):
+        target = "c" * 32
+        self.admin_store.update(lambda state: state["members"].update({
+            target: {
+                "name": "PC-02", "public_key": "c" * 64,
+                "authorization_id": "a" * 64,
+                "last_connected_at": 1,
+            }}))
+        with (patch.object(self.admin.network, "call",
+                           side_effect=OSError("unreachable")),
+              patch.object(self.admin, "_replicate_once")):
+            self.admin.force_remove_computer(target)
+        members = self.admin_store.snapshot()["members"]
+        self.assertNotIn(target, members)
+        self.assertIn(self.user_store.pc_id, members)
 
 
 if __name__ == "__main__":
